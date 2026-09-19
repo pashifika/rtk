@@ -1,14 +1,26 @@
 //! Parses the conservative subset of quoted shell -c wrappers that RTK can rewrite.
 
-/// POSIX-family shells only. `fish` needs a fish-aware lexer to attest its
-/// control keywords (`and`, `or`, `if`) at a command boundary, which the shared
-/// lexer does not model, so a fish script is never treated as rewritable.
-const SUPPORTED_SHELLS: &[&str] = &["sh", "bash", "zsh"];
+use super::lexer::ShellDialect;
+
+/// The shells whose `-c` script RTK will look inside, and the grammar each one
+/// evaluates that script with.
+///
+/// `fish` is here because the wrapper *names* the shell: the script's dialect
+/// is known, so [`ShellDialect::Fish`] rules can be applied to it alone, and
+/// fish's own syntax (`(cmd)` substitution, `and`/`or`/`end` control flow)
+/// defers instead of being rewritten under bash assumptions.
+const SUPPORTED_SHELLS: &[(&str, ShellDialect)] = &[
+    ("sh", ShellDialect::Posix),
+    ("bash", ShellDialect::Posix),
+    ("zsh", ShellDialect::Posix),
+    ("fish", ShellDialect::Fish),
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ShellWrapper {
     script_start: usize,
     script_end: usize,
+    dialect: ShellDialect,
 }
 
 impl ShellWrapper {
@@ -25,6 +37,11 @@ impl ShellWrapper {
         result.push_str(suffix);
         Some(result)
     }
+
+    /// The grammar the named shell evaluates the script with.
+    pub(crate) fn dialect(&self) -> ShellDialect {
+        self.dialect
+    }
 }
 
 /// Recognize a quoted shell -c script without decoding or re-quoting it.
@@ -37,7 +54,7 @@ pub(crate) fn parse_shell_wrapper(command: &str) -> Option<ShellWrapper> {
     if bytes.contains(&b'\0') {
         return None;
     }
-    let shell_end = supported_shell_end(command)?;
+    let (shell_end, dialect) = supported_shell(command)?;
 
     let mut position = skip_horizontal_space(bytes, shell_end);
     if bytes.get(position..position + 2)? != b"-c" {
@@ -74,13 +91,14 @@ pub(crate) fn parse_shell_wrapper(command: &str) -> Option<ShellWrapper> {
     Some(ShellWrapper {
         script_start,
         script_end,
+        dialect,
     })
 }
 
 /// Detect a supported shell whose option list requests command-string mode,
 /// including forms that the strict rewrite parser intentionally rejects.
 pub(crate) fn is_shell_wrapper_candidate(command: &str) -> bool {
-    let Some(shell_end) = supported_shell_end(command) else {
+    let Some((shell_end, _)) = supported_shell(command) else {
         return false;
     };
     let rest_start = skip_horizontal_space(command.as_bytes(), shell_end);
@@ -103,14 +121,17 @@ pub(crate) fn is_shell_wrapper_candidate(command: &str) -> bool {
     false
 }
 
-fn supported_shell_end(command: &str) -> Option<usize> {
+fn supported_shell(command: &str) -> Option<(usize, ShellDialect)> {
     let shell_end = command
         .as_bytes()
         .iter()
         .position(|byte| is_horizontal_space(*byte))?;
     let shell = command.get(..shell_end)?;
     let basename = shell.rsplit(['/', '\\']).next()?;
-    SUPPORTED_SHELLS.contains(&basename).then_some(shell_end)
+    SUPPORTED_SHELLS
+        .iter()
+        .find(|(name, _)| *name == basename)
+        .map(|(_, dialect)| (shell_end, *dialect))
 }
 
 fn is_horizontal_space(byte: u8) -> bool {
@@ -159,8 +180,18 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_shell_wrapper_rejects_fish() {
-        assert_eq!(parsed_script("fish -c 'git status; cargo test'"), None);
+    fn test_parse_shell_wrapper_single_quoted_fish() {
+        let command = "fish -c 'git status; cargo test'";
+        let wrapper = parse_shell_wrapper(command).expect("fish wrapper should parse");
+        assert_eq!(wrapper.script(command), Some("git status; cargo test"));
+        assert_eq!(wrapper.dialect(), ShellDialect::Fish);
+    }
+
+    #[test]
+    fn test_parse_shell_wrapper_reports_the_posix_dialect() {
+        let command = "/bin/bash -c 'git status'";
+        let wrapper = parse_shell_wrapper(command).expect("bash wrapper should parse");
+        assert_eq!(wrapper.dialect(), ShellDialect::Posix);
     }
 
     #[test]
@@ -274,6 +305,7 @@ mod tests {
             "bash -lc 'git status'",
             "bash -e -c 'git status'",
             "/bin/zsh -fc 'git status'",
+            "fish --command 'git status'",
         ] {
             assert!(
                 is_shell_wrapper_candidate(command),
@@ -284,7 +316,7 @@ mod tests {
             "bash script.sh",
             "python -c 'git status'",
             "bash -- script.sh",
-            "fish --command 'git status'",
+            "fish script.fish",
         ] {
             assert!(
                 !is_shell_wrapper_candidate(command),

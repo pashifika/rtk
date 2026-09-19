@@ -376,9 +376,18 @@ bash -c "head foo && grep -R bar ."
 ```
 
 This support is intentionally conservative: it covers exact `sh -c`,
-`bash -c`, and `zsh -c` wrappers with a quoted portable script. Shell expansion
-in an outer double quote, additional shell options, redirects to files, `fish`
-scripts, and nested wrappers pass through unchanged.
+`bash -c`, `zsh -c` and `fish -c` wrappers with a quoted portable script.
+Because the wrapper names the shell, a `fish -c` script is read as fish: its
+own syntax — `(cmd)` substitution, `and`/`or`/`end` control flow — defers
+instead of being rewritten under POSIX assumptions:
+
+```bash
+fish -c 'git status; cargo test'      # → fish -c 'rtk git status; rtk cargo test'
+fish -c 'git status; and cargo test'  # unchanged
+```
+
+Shell expansion in an outer double quote, additional shell options, redirects
+to files, and nested wrappers pass through unchanged.
 
 ### Setup
 

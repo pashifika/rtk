@@ -8,7 +8,7 @@ use std::sync::LazyLock;
 
 use super::lexer::{
     ParsedToken, PipeKind, TokenKind, advance_quote_state, coalesce_words,
-    contains_unattestable_construct, is_crlf_at, redirect_has_file_target, shell_split,
+    contains_unattestable_construct_in, is_crlf_at, redirect_has_file_target, shell_split,
     split_on_operators, tokenize, tokenize_with_newlines,
 };
 use super::rules::{IGNORED_EXACT, IGNORED_PREFIXES, RULES, RtkRule};
@@ -1647,7 +1647,10 @@ fn rewrite_shell_wrapper(
     if script.contains(['\n', '\r'])
         || has_heredoc(script)
         || script.contains("$((")
-        || contains_unattestable_construct(script)
+        // The wrapper names the shell, so the script is checked under that
+        // shell's grammar: fish's `(cmd)` substitution and `and`/`or`/`end`
+        // control flow defer here, where bash's subshells and keywords do not.
+        || contains_unattestable_construct_in(script, wrapper.dialect())
     {
         return None;
     }
@@ -7823,11 +7826,59 @@ mod tests {
     }
 
     #[test]
-    fn test_shell_wrapper_leaves_fish_command_string_alone() {
+    fn test_shell_wrapper_rewrites_fish_portable_command_string() {
         assert_eq!(
             rewrite_command_no_prefixes("fish -c 'git status; cargo test'", &[]),
-            None
+            Some("fish -c 'rtk git status; rtk cargo test'".into())
         );
+    }
+
+    #[test]
+    fn test_shell_wrapper_defers_fish_specific_scripts() {
+        // `(cmd)` is substitution and `and`/`if`/`end` are control flow in the
+        // script's own shell, so the wrapper hands them back untouched.
+        for command in [
+            "fish -c 'git status; and cargo test'",
+            "fish -c 'git status (pwd)'",
+            "fish -c 'if test -d src; git status; end'",
+            "fish -c 'not git status'",
+        ] {
+            assert_eq!(
+                rewrite_command_no_prefixes(command, &[]),
+                None,
+                "fish-specific script must pass through: {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_fish_rules_do_not_reach_bash_commands() {
+        // The same shapes outside a fish wrapper are ordinary bash, and stay
+        // rewritable: a subshell, a keyword block, and both inside a POSIX
+        // wrapper's script.
+        for (command, expected) in [
+            (
+                "git log -20 && (cd www && npm test)",
+                "rtk git log -20 && (cd www && npm test)",
+            ),
+            ("(cd sub && git status)", "(cd sub && rtk git status)"),
+            (
+                "git status; if true; then echo x; fi",
+                "rtk git status; if true; then echo x; fi",
+            ),
+            (
+                // In bash `and` is just a command name, so only `git status`
+                // rewrites — but the script is still attested and rewritten.
+                "bash -c 'git status; and cargo test'",
+                "bash -c 'rtk git status; and cargo test'",
+            ),
+        ] {
+            assert_eq!(
+                rewrite_command_no_prefixes(command, &[]),
+                Some(expected.into()),
+                "bash command must still rewrite: {command:?}"
+            );
+        }
     }
 
     #[test]

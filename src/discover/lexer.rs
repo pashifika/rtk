@@ -404,9 +404,9 @@ pub(crate) fn contains_unattestable_construct_in(cmd: &str, dialect: ShellDialec
         .any(|(i, tok)| tok.kind == TokenKind::Redirect && redirect_has_file_target(&tokens, i))
 }
 
-/// Fish's own syntax: bare `(…)` substitution anywhere, or a control keyword at
-/// a command boundary. Newlines are boundaries here, so a keyword opening a
-/// line of a multi-line script is seen.
+/// Fish's own syntax: bare `(…)` substitution anywhere, a control keyword at a
+/// command boundary, or the `&|` pipe. Newlines are boundaries here, so a
+/// keyword opening a line of a multi-line script is seen.
 fn contains_fish_only_construct(tokens: &[ParsedToken]) -> bool {
     const FISH_CONTROL_KEYWORDS: &[&str] = &[
         "and", "or", "not", "begin", "end", "if", "else", "switch", "case", "for", "while",
@@ -414,7 +414,19 @@ fn contains_fish_only_construct(tokens: &[ParsedToken]) -> bool {
     ];
 
     let mut command_position = true;
+    // Byte just past a `&` token, to spot the `&|` pair below.
+    let mut ampersand_end = None;
     for token in tokens {
+        // `&|` pipes stdout and stderr in fish. This lexer reads it as a
+        // background `&` followed by a pipe, and the rewrite re-emits the two
+        // spaced, which fish rejects outright — so leave the script alone.
+        if matches!(token.kind, TokenKind::Pipe(_)) && ampersand_end == Some(token.offset) {
+            return true;
+        }
+        ampersand_end = match &token.kind {
+            TokenKind::Shellism if token.value == "&" => Some(token.offset + token.value.len()),
+            _ => None,
+        };
         match token.kind {
             TokenKind::Shellism if matches!(token.value.as_str(), "(" | ")") => return true,
             TokenKind::Operator | TokenKind::Pipe(_) => command_position = true,
@@ -1506,6 +1518,22 @@ mod tests {
                 "bash command must stay attestable: {cmd:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_fish_dialect_refuses_the_stdout_and_stderr_pipe() {
+        // `&|` is one fish operator; re-emitted as `& |` it stops parsing.
+        for script in ["git status &| cargo test", "git status&|cargo test"] {
+            assert!(
+                contains_unattestable_construct_in(script, ShellDialect::Fish),
+                "fish `&|` must not be attested: {script:?}"
+            );
+        }
+        // A background `&` followed by a separate command is still fine.
+        assert!(!contains_unattestable_construct_in(
+            "git status & cargo test",
+            ShellDialect::Fish
+        ));
     }
 
     #[test]

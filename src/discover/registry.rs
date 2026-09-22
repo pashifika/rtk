@@ -7719,6 +7719,7 @@ mod tests {
             "fish -c 'git status (pwd)'",
             "fish -c 'if test -d src; git status; end'",
             "fish -c 'not git status'",
+            "fish -c 'git status &| cargo test'",
         ] {
             assert_eq!(
                 rewrite_command_no_prefixes(command, &[]),

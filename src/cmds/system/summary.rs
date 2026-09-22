@@ -15,27 +15,36 @@ const MAX_SUMMARY_KEYS: usize = CAP_WARNINGS;
 pub fn run(command: &[String], shell: Option<&str>, verbose: u8) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
     let command_display = crate::core::shell::display_args(command);
+    let program = crate::core::shell::program_name(command, shell);
 
     if verbose > 0 {
         eprintln!("Running and summarizing: {}", command_display);
     }
 
+    // A program that cannot be run is summarized like any other failed run,
+    // carrying the code the shell RTK replaced would have returned.
+    let report_unrunnable = |outcome: crate::core::shell::Unrunnable| {
+        let summary = summarize_output(&outcome.message, &command_display, false);
+        let shown = never_worse(&outcome.message, &summary);
+        println!("{}", shown);
+        timer.track(&command_display, "rtk summary", &outcome.message, shown);
+        outcome.code
+    };
+
     let result = match crate::core::shell::command_from_args(command, shell)
         .context("Failed to prepare summary command")?
     {
-        crate::core::shell::Launch::Ready(mut cmd) => {
-            exec_capture(&mut cmd).context("Failed to execute command")?
-        }
-        // A program that cannot be resolved is summarized like any other
-        // failed run, with the shell's own exit code (127).
-        crate::core::shell::Launch::NotFound(program) => {
-            let raw = crate::core::shell::not_found_output(&program);
-            let summary = summarize_output(&raw, &command_display, false);
-            let shown = never_worse(&raw, &summary);
-            println!("{}", shown);
-            timer.track(&command_display, "rtk summary", &raw, shown);
-            return Ok(crate::core::shell::EXIT_COMMAND_NOT_FOUND);
-        }
+        crate::core::shell::Launch::Ready(mut cmd) => match exec_capture(&mut cmd) {
+            Ok(result) => result,
+            Err(error) => {
+                let error = error.context("Failed to execute command");
+                match crate::core::shell::spawn_failure(program, &error) {
+                    Some(outcome) => return Ok(report_unrunnable(outcome)),
+                    None => return Err(error),
+                }
+            }
+        },
+        crate::core::shell::Launch::Unrunnable(outcome) => return Ok(report_unrunnable(outcome)),
     };
 
     let raw = format!("{}\n{}", result.stdout, result.stderr);

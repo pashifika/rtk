@@ -1578,6 +1578,17 @@ fn run_fallback(parse_error: clap::Error) -> Result<i32> {
         parse_error.exit();
     }
 
+    // `rtk test` deliberately shadows the POSIX `test` binary, so it cannot join
+    // that list — but a misused `--shell` is RTK's own flag, not something to
+    // hand to `test`. Without this, `rtk test --shell` execs the real `test`
+    // with no arguments and exits 0, silently ignoring the request (#4125).
+    if args
+        .iter()
+        .any(|arg| arg == "--shell" || arg.starts_with("--shell="))
+    {
+        parse_error.exit();
+    }
+
     let raw_command = args.join(" ");
     let error_message = core::utils::strip_ansi(&parse_error.to_string());
 
@@ -1948,12 +1959,26 @@ fn is_native_test_expression(command: &[String]) -> bool {
     }
 }
 
-/// Split the leading `!` tokens off a command, returning how many were removed.
+/// Strip the shell grouping a command carries, returning how many negations were
+/// removed along with the command itself.
 ///
-/// `!` is both `test`'s negation and the shell's. A command behind it is not a
-/// native expression, so it runs through the test filter — and the negation the
-/// shell used to apply has to come from somewhere.
+/// `!` and `( … )` are both `test`'s syntax and the shell's, and
+/// [`is_native_test_expression`] already treats them as possible native
+/// prefixes. A command behind them is not a native expression, so it runs
+/// through the test filter — and the negation and grouping the joined `sh -c`
+/// string used to get from the shell have to come from somewhere.
 fn split_leading_negations(command: Vec<String>) -> (usize, Vec<String>) {
+    let mut command = command;
+
+    // `( cmd )` groups; the subshell it asked for buys nothing here, since the
+    // command runs in its own process either way.
+    if command.len() > 2
+        && command.first().is_some_and(|token| token == "(")
+        && command.last().is_some_and(|token| token == ")")
+    {
+        command = command[1..command.len() - 1].to_vec();
+    }
+
     let negations = command.iter().take_while(|token| *token == "!").count();
     // All `!` and nothing to negate: leave it alone so the runner reports it.
     if negations == command.len() {
@@ -1967,18 +1992,25 @@ fn split_leading_negations(command: Vec<String>) -> (usize, Vec<String>) {
 /// Clap cannot express "exactly one value for this positional when that flag is
 /// present", and `run` spells the same rule as `conflicts_with`/`requires`
 /// around its own `-c`. Enforcing it here keeps the other three surfaces
-/// answering with a usage error instead of failing mid-execution.
-fn require_single_script(shell: Option<&str>, command: &[String]) {
+/// answering with a usage error instead of failing mid-execution — reported by
+/// the subcommand that was asked, so the usage line names it.
+fn require_single_script(subcommand: &str, shell: Option<&str>, command: &[String]) {
     use clap::CommandFactory;
 
-    if shell.is_some() && command.len() != 1 {
-        Cli::command()
-            .error(
-                ErrorKind::WrongNumberOfValues,
-                "--shell takes the complete command as one quoted argument",
-            )
-            .exit();
+    if shell.is_none() || command.len() == 1 {
+        return;
     }
+
+    let mut cli = Cli::command();
+    let surface = cli
+        .find_subcommand_mut(subcommand)
+        .expect("every caller names its own subcommand");
+    surface
+        .error(
+            ErrorKind::WrongNumberOfValues,
+            core::shell::SHELL_ARITY_MESSAGE,
+        )
+        .exit();
 }
 
 fn run_cli() -> Result<i32> {
@@ -2276,13 +2308,13 @@ fn run_cli() -> Result<i32> {
         }
 
         Commands::Err { shell, command } => {
-            require_single_script(shell.as_deref(), &command);
+            require_single_script("err", shell.as_deref(), &command);
             runner::run_err(&command, shell.as_deref(), cli.verbose)
                 .context("Failed to run err command")?
         }
 
         Commands::Test { shell, command } => {
-            require_single_script(shell.as_deref(), &command);
+            require_single_script("test", shell.as_deref(), &command);
             // A native `test` expression (`rtk test -f Cargo.toml`) still goes
             // to the real `test` binary; `--shell` means the caller asked for a
             // script, so it never takes that path.
@@ -2421,7 +2453,7 @@ fn run_cli() -> Result<i32> {
         },
 
         Commands::Summary { shell, command } => {
-            require_single_script(shell.as_deref(), &command);
+            require_single_script("summary", shell.as_deref(), &command);
             summary::run(&command, shell.as_deref(), cli.verbose)
                 .context("Failed to run summary command")?
         }
@@ -3054,33 +3086,41 @@ fn run_cli() -> Result<i32> {
             {
                 0
             } else {
-                let (launch, description) = match command {
+                let (launch, description, program) = match command {
                     Some(script) => (
-                        core::shell::Launch::Ready(
-                            core::shell::shell_command(&script, shell.as_deref())
-                                .context("Failed to prepare run shell command")?,
-                        ),
+                        core::shell::shell_command(&script, shell.as_deref())
+                            .context("Failed to prepare run shell command")?,
                         format!("shell command: {script}"),
+                        core::shell::program_name(&[], shell.as_deref()).to_string(),
                     ),
                     None => (
                         core::shell::direct_command(&args)
                             .context("Failed to prepare direct run command")?,
                         core::shell::display_args(&args),
+                        core::shell::program_name(&args, None).to_string(),
                     ),
                 };
                 match launch {
-                    core::shell::Launch::Ready(mut prepared) => {
-                        let status = prepared
-                            .status()
-                            .with_context(|| format!("Failed to execute {description}"))?;
-                        core::utils::exit_code_from_status(&status, "run")
-                    }
-                    // `rtk run` is a raw passthrough, so it reports an
-                    // unresolvable program the way a shell does: the message on
-                    // stderr and POSIX exit 127.
-                    core::shell::Launch::NotFound(program) => {
-                        eprint!("{}", core::shell::not_found_output(&program));
-                        core::shell::EXIT_COMMAND_NOT_FOUND
+                    core::shell::Launch::Ready(mut prepared) => match prepared.status() {
+                        Ok(status) => core::utils::exit_code_from_status(&status, "run"),
+                        Err(error) => {
+                            let error = anyhow::Error::new(error)
+                                .context(format!("Failed to execute {description}"));
+                            match core::shell::spawn_failure(&program, &error) {
+                                Some(outcome) => {
+                                    eprint!("{}", outcome.message);
+                                    outcome.code
+                                }
+                                None => return Err(error),
+                            }
+                        }
+                    },
+                    // `rtk run` is a raw passthrough, so it reports a program it
+                    // cannot run the way a shell does: the message on stderr and
+                    // the shell's own exit code.
+                    core::shell::Launch::Unrunnable(outcome) => {
+                        eprint!("{}", outcome.message);
+                        outcome.code
                     }
                 }
             }
@@ -3858,7 +3898,10 @@ mod tests {
         // RTK meta-commands should produce parse errors (not fall through to raw execution).
         // Skip "proxy" because it uses trailing_var_arg (accepts any args by design).
         for cmd in core::constants::RTK_META_COMMANDS {
-            if matches!(*cmd, "proxy" | "run" | "rewrite" | "session") {
+            if matches!(
+                *cmd,
+                "proxy" | "run" | "rewrite" | "session" | "err" | "summary"
+            ) {
                 continue; // these use trailing_var_arg (accept any args by design)
             }
             let result = Cli::try_parse_from(["rtk", cmd, "--nonexistent-flag-xyz"]);
@@ -3889,7 +3932,6 @@ mod tests {
             "aws",
             "psql",
             "pnpm",
-            "err",
             "test",
             "env",
             "find",
@@ -3899,7 +3941,6 @@ mod tests {
             "docker",
             "kubectl",
             "oc",
-            "summary",
             "grep",
             "wget",
             "wc",

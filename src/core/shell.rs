@@ -1,7 +1,7 @@
 //! Builds direct and explicit-shell commands without guessing the caller's shell.
 
-use crate::core::utils::{resolve_binary, resolved_command};
-use anyhow::{Context, Result, bail};
+use crate::core::utils::{ChildArgExt, resolve_binary, resolved_command};
+use anyhow::{Result, bail};
 use std::borrow::Cow;
 use std::path::Path;
 use std::process::Command;
@@ -13,22 +13,107 @@ use std::process::Command;
 /// CI steps branch on 127, and RTK's own `[FAIL]` line carries it.
 pub const EXIT_COMMAND_NOT_FOUND: i32 = 127;
 
-/// A command ready to spawn, or the program name that could not be resolved.
+/// POSIX "found, but could not be executed" — a directory, a file without `+x`,
+/// or something the kernel refuses to exec. `sh`, `dash` and `bash` all answer
+/// 126 here and 127 only for a genuinely missing program; the same distinction
+/// is what a CI step reads.
+pub const EXIT_COMMAND_NOT_EXECUTABLE: i32 = 126;
+
+/// `--shell` runs one complete script, so it takes exactly one argument.
 ///
-/// A missing program is an execution outcome, not an RTK error: the runners
-/// render it through their own failure path and exit [`EXIT_COMMAND_NOT_FOUND`],
-/// the way the shell they replaced did.
+/// One rule, one wording: the CLI reports it as a clap usage error before
+/// execution, and [`command_from_args`] refuses the same shape.
+pub const SHELL_ARITY_MESSAGE: &str = "--shell takes the complete command as one quoted argument";
+
+/// A command ready to spawn, or the reason it can never run.
+///
+/// A program that cannot be run is an execution outcome, not an RTK error: the
+/// runners render it through their own failure path and exit with the code the
+/// shell they replaced would have returned.
 pub enum Launch {
     Ready(Command),
-    NotFound(String),
+    Unrunnable(Unrunnable),
 }
 
-/// The output a shell prints for a program it cannot resolve, in RTK's voice.
+/// What a shell prints, and exits with, for a program it cannot run.
+pub struct Unrunnable {
+    /// The line a shell writes to stderr, in RTK's voice.
+    pub message: String,
+    /// [`EXIT_COMMAND_NOT_FOUND`] or [`EXIT_COMMAND_NOT_EXECUTABLE`].
+    pub code: i32,
+}
+
+impl Unrunnable {
+    fn not_found(program: &str) -> Self {
+        Self {
+            message: format!("rtk: {program}: command not found\n"),
+            code: EXIT_COMMAND_NOT_FOUND,
+        }
+    }
+
+    fn not_executable(program: &str, reason: &str) -> Self {
+        Self {
+            message: format!("rtk: {program}: {reason}\n"),
+            code: EXIT_COMMAND_NOT_EXECUTABLE,
+        }
+    }
+}
+
+/// Classify a program that `resolve_binary` could not resolve.
 ///
-/// Fed to the runners' filters so a missing program renders like any other
-/// failed run instead of surfacing as an `anyhow` chain on stderr.
-pub fn not_found_output(program: &str) -> String {
-    format!("rtk: {program}: command not found\n")
+/// `which` answers one thing — "is this runnable from here" — for two different
+/// situations, so a spelling that addresses the filesystem is stat'd to tell
+/// them apart. A bare `PATH` name stays 127 even when a non-executable file of
+/// that name exists somewhere, which is what `dash` and `bash` do.
+fn classify_unrunnable(program: &str) -> Unrunnable {
+    if !names_a_path(program) {
+        return Unrunnable::not_found(program);
+    }
+
+    match std::fs::metadata(program) {
+        Ok(meta) if meta.is_dir() => Unrunnable::not_executable(program, "Is a directory"),
+        Ok(_) => Unrunnable::not_executable(program, "Permission denied"),
+        Err(_) => Unrunnable::not_found(program),
+    }
+}
+
+/// True for a spelling that addresses the filesystem rather than `PATH`.
+fn names_a_path(program: &str) -> bool {
+    program.contains('/') || (cfg!(windows) && program.contains('\\'))
+}
+
+/// Map a spawn failure to the answer a shell would have given, or `None` when it
+/// is not about the program itself.
+///
+/// Resolution proves a name resolves; it cannot prove `execve` will accept the
+/// file. A shebang with CRLF line endings, an interpreter that is missing, and a
+/// file that is not a valid executable all fail here instead, and a shell
+/// reports them as 127 or 126 rather than as an error of its own.
+pub fn spawn_failure(program: &str, error: &anyhow::Error) -> Option<Unrunnable> {
+    let io_error = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())?;
+
+    // ENOEXEC: not a recognized executable format. It has no stable
+    // `ErrorKind`, so it is matched on the raw code where one exists.
+    const ENOEXEC: i32 = 8;
+    if io_error.raw_os_error() == Some(ENOEXEC) {
+        return Some(Unrunnable::not_executable(
+            program,
+            "cannot execute binary file",
+        ));
+    }
+
+    match io_error.kind() {
+        std::io::ErrorKind::NotFound => Some(Unrunnable::not_found(program)),
+        std::io::ErrorKind::PermissionDenied => {
+            Some(Unrunnable::not_executable(program, "Permission denied"))
+        }
+        std::io::ErrorKind::IsADirectory => {
+            Some(Unrunnable::not_executable(program, "Is a directory"))
+        }
+        _ => None,
+    }
 }
 
 /// Build a command that preserves the argument boundaries supplied by Clap.
@@ -38,29 +123,33 @@ pub fn direct_command(args: &[String]) -> Result<Launch> {
     };
 
     if resolve_binary(program).is_err() {
-        return Ok(Launch::NotFound(program.clone()));
+        return Ok(Launch::Unrunnable(classify_unrunnable(program)));
     }
 
     let mut command = resolved_command(program);
-    command.args(program_args);
+    // These arguments came off rtk's own command line, so they take the
+    // encoding MSYS/Cygwin children expect on Windows (#3728).
+    command.child_args(program_args);
     Ok(Launch::Ready(command))
 }
 
 /// Build a command string invocation using an explicit shell or the platform default.
-pub fn shell_command(script: &str, shell: Option<&str>) -> Result<Command> {
+pub fn shell_command(script: &str, shell: Option<&str>) -> Result<Launch> {
     let program = shell.unwrap_or(default_shell());
     if program.trim().is_empty() {
         bail!("shell must not be empty");
     }
 
-    let mut command = match shell {
-        Some(_) => Command::new(
-            resolve_binary(program).with_context(|| format!("Shell '{program}' not found"))?,
-        ),
-        None => resolved_command(program),
-    };
-    command.arg(command_flag(program)).arg(script);
-    Ok(command)
+    // A named shell is resolved up front so an unusable one reports the shell's
+    // own answer, the same way an unusable program does. The platform default
+    // keeps `resolved_command`'s fallback: it is RTK's choice, not the caller's.
+    if shell.is_some() && resolve_binary(program).is_err() {
+        return Ok(Launch::Unrunnable(classify_unrunnable(program)));
+    }
+
+    let mut command = resolved_command(program);
+    command.arg(command_flag(program)).child_arg(script);
+    Ok(Launch::Ready(command))
 }
 
 /// Build a direct command by default, or an explicit shell command when requested.
@@ -70,19 +159,26 @@ pub fn shell_command(script: &str, shell: Option<&str>) -> Result<Command> {
 pub fn command_from_args(args: &[String], shell: Option<&str>) -> Result<Launch> {
     match shell {
         Some(shell) => match args {
-            [script] => shell_command(script, Some(shell)).map(Launch::Ready),
+            [script] => shell_command(script, Some(shell)),
             [] => bail!("command is required when --shell is used"),
-            _ => bail!("pass the shell command as one quoted argument after --shell"),
+            _ => bail!(SHELL_ARITY_MESSAGE),
         },
         None => direct_command(args),
     }
 }
 
+/// The program a launch would have executed, for the message a failure carries.
+pub fn program_name<'a>(args: &'a [String], shell: Option<&'a str>) -> &'a str {
+    shell
+        .or_else(|| args.first().map(String::as_str))
+        .unwrap_or("command")
+}
+
 /// Render argv for logging, tracking labels and ecosystem detection.
 ///
-/// Arguments that carry whitespace or quotes are re-quoted, so a tracked label
-/// reads back as the command that ran instead of collapsing
-/// `--filter "a b"` into two words.
+/// Anything a shell would have interpreted is quoted, so a label reads back as
+/// the command that ran — `rtk err /bin/echo '*' 'a;b'` is recorded with its
+/// `*` and `;` intact rather than as something a shell would expand.
 pub fn display_args(args: &[String]) -> String {
     args.iter()
         .map(|arg| quote_for_display(arg))
@@ -90,8 +186,15 @@ pub fn display_args(args: &[String]) -> String {
         .join(" ")
 }
 
+/// Everything a POSIX shell gives meaning to, plus the quote characters. An
+/// argument containing none of these reads back the way it was typed.
+const SHELL_METACHARACTERS: &[char] = &[
+    ' ', '\t', '\n', '\r', '\'', '"', '\\', '*', '?', '[', ']', '{', '}', '(', ')', '$', '&', ';',
+    '|', '<', '>', '`', '!', '#', '~', '=', '^',
+];
+
 fn quote_for_display(arg: &str) -> Cow<'_, str> {
-    if !arg.is_empty() && !arg.contains([' ', '\t', '\n', '\'', '"', '\\']) {
+    if !arg.is_empty() && !arg.contains(SHELL_METACHARACTERS) {
         return Cow::Borrowed(arg);
     }
     Cow::Owned(format!("'{}'", arg.replace('\'', r"'\''")))
@@ -129,7 +232,16 @@ mod tests {
     fn ready(launch: Launch) -> Command {
         match launch {
             Launch::Ready(command) => command,
-            Launch::NotFound(program) => panic!("expected a spawnable command, got {program}"),
+            Launch::Unrunnable(unrunnable) => {
+                panic!("expected a spawnable command, got {}", unrunnable.message)
+            }
+        }
+    }
+
+    fn unrunnable(launch: Launch) -> Unrunnable {
+        match launch {
+            Launch::Unrunnable(unrunnable) => unrunnable,
+            Launch::Ready(_) => panic!("expected an unrunnable program"),
         }
     }
 
@@ -156,12 +268,69 @@ mod tests {
     }
 
     #[test]
-    fn direct_command_reports_an_unresolvable_program() {
+    fn direct_command_reports_a_missing_program_as_127() {
         let args = vec!["rtk-no-such-binary-4c1f".to_string(), "arg".to_string()];
-        match direct_command(&args).expect("missing program is an outcome, not an error") {
-            Launch::NotFound(program) => assert_eq!(program, "rtk-no-such-binary-4c1f"),
-            Launch::Ready(_) => panic!("unresolvable program must not be spawnable"),
-        }
+        let outcome = unrunnable(direct_command(&args).expect("missing program is an outcome"));
+
+        assert_eq!(outcome.code, EXIT_COMMAND_NOT_FOUND);
+        assert!(
+            outcome.message.contains("command not found"),
+            "{}",
+            outcome.message
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_command_reports_an_unexecutable_path_as_126() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let file = dir.path().join("noexec");
+        std::fs::write(&file, b"not executable").expect("write file");
+
+        let args = vec![file.to_string_lossy().into_owned()];
+        let outcome = unrunnable(direct_command(&args).expect("unusable program is an outcome"));
+        assert_eq!(outcome.code, EXIT_COMMAND_NOT_EXECUTABLE);
+        assert!(
+            outcome.message.contains("Permission denied"),
+            "{}",
+            outcome.message
+        );
+
+        let args = vec![dir.path().to_string_lossy().into_owned()];
+        let outcome = unrunnable(direct_command(&args).expect("a directory is an outcome"));
+        assert_eq!(outcome.code, EXIT_COMMAND_NOT_EXECUTABLE);
+        assert!(
+            outcome.message.contains("Is a directory"),
+            "{}",
+            outcome.message
+        );
+    }
+
+    #[test]
+    fn bare_path_names_without_a_separator_stay_127() {
+        // `dash` answers 127 for a bare name it cannot resolve even when a
+        // non-executable file of that name exists in the working directory.
+        let outcome = classify_unrunnable("Cargo.toml");
+        assert_eq!(outcome.code, EXIT_COMMAND_NOT_FOUND);
+    }
+
+    #[test]
+    fn spawn_failure_maps_the_program_errors_and_nothing_else() {
+        let not_found = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound))
+            .context("Failed to spawn process");
+        assert_eq!(
+            spawn_failure("prog", &not_found).expect("mapped").code,
+            EXIT_COMMAND_NOT_FOUND
+        );
+
+        let denied = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert_eq!(
+            spawn_failure("prog", &denied).expect("mapped").code,
+            EXIT_COMMAND_NOT_EXECUTABLE
+        );
+
+        let unrelated = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        assert!(spawn_failure("prog", &unrelated).is_none());
     }
 
     #[test]
@@ -175,6 +344,14 @@ mod tests {
     #[test]
     fn shell_command_rejects_empty_shell() {
         assert!(shell_command("echo ok", Some(" ")).is_err());
+    }
+
+    #[test]
+    fn shell_command_reports_a_missing_shell_as_an_outcome() {
+        let outcome = unrunnable(
+            shell_command("echo ok", Some("rtk-no-such-shell-4c1f")).expect("outcome, not error"),
+        );
+        assert_eq!(outcome.code, EXIT_COMMAND_NOT_FOUND);
     }
 
     #[test]
@@ -194,14 +371,20 @@ mod tests {
     }
 
     #[test]
-    fn display_args_requotes_arguments_that_carry_spaces() {
+    fn display_args_quotes_every_shell_metacharacter() {
         let args = vec![
-            "cargo".to_string(),
-            "test".to_string(),
-            "--filter".to_string(),
+            "/bin/echo".to_string(),
             "a b".to_string(),
+            "*".to_string(),
+            "$HOME".to_string(),
+            "a;b".to_string(),
+            "x&&y".to_string(),
+            "p|q".to_string(),
         ];
 
-        assert_eq!(display_args(&args), "cargo test --filter 'a b'");
+        assert_eq!(
+            display_args(&args),
+            "/bin/echo 'a b' '*' '$HOME' 'a;b' 'x&&y' 'p|q'"
+        );
     }
 }

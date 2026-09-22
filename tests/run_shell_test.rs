@@ -79,7 +79,7 @@ mod unix {
     }
 
     #[test]
-    fn explicit_missing_shell_reports_actionable_error() {
+    fn explicit_missing_shell_reports_the_shell_contract() {
         let output = rtk()
             .args([
                 "run",
@@ -91,10 +91,13 @@ mod unix {
             .output()
             .expect("run rtk");
 
-        assert!(!output.status.success());
+        // A shell that is not there answers like a program that is not there:
+        // the shell's own line and exit 127, not an RTK error chain.
+        assert_eq!(output.status.code(), Some(127));
+        let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            String::from_utf8_lossy(&output.stderr)
-                .contains("Shell 'rtk-missing-shell-for-test' not found")
+            stderr.contains("rtk-missing-shell-for-test: command not found"),
+            "{stderr}"
         );
     }
 
@@ -190,6 +193,208 @@ mod unix {
         assert_eq!(output.status.code(), Some(127));
         assert!(
             String::from_utf8_lossy(&output.stderr)
+                .contains("rtk-no-such-binary-4c1f: command not found")
+        );
+    }
+
+    /// 126 is the other half of the contract: `sh`, `dash` and `bash` all
+    /// answer 126 for something that exists and cannot be executed, and 127
+    /// only for a program that is not there at all.
+    #[test]
+    fn an_unexecutable_path_reports_exit_126() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let file = dir.path().join("noexec");
+        std::fs::write(&file, b"not executable\n").expect("write file");
+        let path = file.to_string_lossy().into_owned();
+
+        for subcommand in ["err", "test", "summary"] {
+            let output = rtk()
+                .args([subcommand, &path])
+                .output()
+                .unwrap_or_else(|e| panic!("run rtk {subcommand}: {e}"));
+
+            assert_eq!(output.status.code(), Some(126), "{subcommand}");
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("Permission denied"),
+                "{subcommand}"
+            );
+        }
+
+        let output = rtk().args(["run", &path]).output().expect("run rtk run");
+        assert_eq!(output.status.code(), Some(126));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("Permission denied"));
+    }
+
+    #[test]
+    fn a_directory_reports_exit_126() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().to_string_lossy().into_owned();
+
+        let output = rtk().args(["run", &path]).output().expect("run rtk run");
+        assert_eq!(output.status.code(), Some(126));
+    }
+
+    /// Resolution proves the name resolves; `execve` still refuses a CRLF
+    /// shebang (its interpreter is `/bin/sh\r`) and a file that is not a valid
+    /// executable. Both used to surface as an anyhow chain and exit 1.
+    #[test]
+    fn spawn_failures_keep_the_shell_contract() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("create tempdir");
+
+        let crlf = dir.path().join("crlf.sh");
+        std::fs::write(&crlf, b"#!/bin/sh\r\necho hi\r\n").expect("write script");
+        std::fs::set_permissions(&crlf, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod script");
+
+        let output = rtk()
+            .args(["err", &crlf.to_string_lossy()])
+            .output()
+            .expect("run rtk err");
+        assert_eq!(output.status.code(), Some(127));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("[FAIL] Command failed (exit code: 127)"),
+            "{stdout}"
+        );
+
+        // An `+x` file the kernel cannot exec: on Linux `execvp` reports
+        // ENOEXEC, while on macOS it falls back to `sh`, which answers 127
+        // itself. Either way the outcome is a shell's, never an RTK error.
+        let binary = dir.path().join("not-an-executable");
+        std::fs::write(&binary, b"\x7fELF-but-not-really").expect("write file");
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod file");
+
+        let output = rtk()
+            .args(["run", &binary.to_string_lossy()])
+            .output()
+            .expect("run rtk run");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            matches!(output.status.code(), Some(126) | Some(127)),
+            "{:?} / {stderr}",
+            output.status.code()
+        );
+        assert!(!stderr.contains("Failed to spawn process"), "{stderr}");
+    }
+
+    /// `--shell` is the first flag these surfaces have, and a missing value is
+    /// the likeliest way to get it wrong. It must report the flag error, not
+    /// exec a program named after the subcommand.
+    #[test]
+    fn a_missing_shell_value_reports_a_flag_error() {
+        for subcommand in ["err", "test", "summary", "run"] {
+            let output = rtk()
+                .args([subcommand, "--shell"])
+                .output()
+                .unwrap_or_else(|e| panic!("run rtk {subcommand}: {e}"));
+
+            assert_eq!(output.status.code(), Some(2), "{subcommand}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("--shell <SHELL>"),
+                "{subcommand}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    /// The two named-shell tests above skip wherever `fish` is absent, which is
+    /// every CI runner — this one names a shell that always exists, so the
+    /// explicit-shell branch is actually exercised somewhere.
+    #[test]
+    fn explicit_shell_by_name_runs_the_named_shell() {
+        let output = rtk()
+            .args(["run", "--shell", "sh", "-c", "printf 'shell_ok'"])
+            .output()
+            .expect("run rtk run");
+
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "shell_ok");
+    }
+
+    #[test]
+    fn an_unresolvable_shell_reports_the_shell_contract() {
+        let output = rtk()
+            .args(["run", "--shell", "rtk-no-such-shell-4c1f", "-c", "echo hi"])
+            .output()
+            .expect("run rtk run");
+
+        assert_eq!(output.status.code(), Some(127));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("rtk-no-such-shell-4c1f"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn grouped_and_negated_commands_keep_their_exit_codes() {
+        // `!` and `( … )` are `test`'s syntax as much as the shell's; the joined
+        // `sh -c` string used to apply both.
+        for (args, expected) in [
+            (vec!["test", "!", "false"], 0),
+            (vec!["test", "!", "true"], 1),
+            (vec!["test", "(", "false", ")"], 1),
+            (vec!["test", "(", "!", "false", ")"], 0),
+        ] {
+            let output = rtk()
+                .args(&args)
+                .output()
+                .unwrap_or_else(|e| panic!("run rtk {args:?}: {e}"));
+            assert_eq!(output.status.code(), Some(expected), "{args:?}");
+        }
+    }
+}
+
+#[cfg(windows)]
+mod windows {
+    use std::process::Command;
+
+    fn rtk() -> Command {
+        Command::new(env!("CARGO_BIN_EXE_rtk"))
+    }
+
+    /// Direct execution resolves through `%PATH%` (and `PATHEXT`), where the
+    /// `cmd /C` string it replaced also searched the working directory and
+    /// carried builtins. Anything `cmd`-specific now needs `rtk run -c`.
+    #[test]
+    fn direct_execution_resolves_through_path() {
+        let output = rtk()
+            .args(["run", "cmd", "/C", "echo windows_ok"])
+            .output()
+            .expect("run rtk run");
+
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("windows_ok"));
+    }
+
+    /// Arguments arriving on rtk's own command line keep their boundaries and
+    /// their quotes through `child_args` (#3728).
+    #[test]
+    fn quoted_arguments_reach_the_child_intact() {
+        let output = rtk()
+            .args(["run", "cmd", "/C", "echo", "a b", "c\"d"])
+            .output()
+            .expect("run rtk run");
+
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("a b"), "{stdout}");
+        assert!(stdout.contains("c\"d"), "{stdout}");
+    }
+
+    #[test]
+    fn missing_program_reports_exit_127() {
+        let output = rtk()
+            .args(["err", "rtk-no-such-binary-4c1f"])
+            .output()
+            .expect("run rtk err");
+
+        assert_eq!(output.status.code(), Some(127));
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
                 .contains("rtk-no-such-binary-4c1f: command not found")
         );
     }

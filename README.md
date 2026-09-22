@@ -321,6 +321,21 @@ explicit shell script as one quoted argument; RTK does not infer the parser
 from `$SHELL` because the environment value may differ from the actual command
 executor.
 
+A program that cannot be run answers the way the shell used to: `127` with a
+`command not found` line, `126` for a path that exists but is a directory or is
+not executable.
+
+**Windows note.** The `cmd /C` string these commands used to build also
+searched the working directory and carried `cmd`'s builtins (`echo`, `dir`,
+`type`, `set`, `copy`, `del`, …). Direct execution resolves through `%PATH%`
+and `PATHEXT` only, so `rtk err dir`, `rtk summary echo hi`, and a tool sitting
+in the current directory now need the explicit form: `rtk run -c 'dir'`, or
+`rtk err --shell cmd 'echo hi'`. On Unix nothing equivalent is lost — `sh` does
+not search `.`, and `echo`, `test` and `pwd` all exist as real binaries. One
+more difference on both platforms: the child sees the resolved absolute path in
+`argv[0]` where the shell used to pass the spelling as typed, which matters
+only to multi-call binaries and to tools that print usage from `argv[0]`.
+
 ### Token Savings Analytics
 ```bash
 rtk gain                        # Summary stats

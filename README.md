@@ -426,17 +426,22 @@ fish execution:
 if test -d src
   git status
 end
-# → rtk run --shell fish -c 'if test -d src\n  git status\nend'
+# → rtk run --shell fish -c 'if test -d src\n  rtk git status\nend'
 ```
 
-The script travels byte-identical inside one quoted argument, so both POSIX and
-fish host layers parse the wrapped command. The wrap always surfaces as an
-"ask" rewrite — never auto-allowed — because the script's content cannot be
+The script travels inside one quoted argument, so both POSIX and fish host
+layers parse the wrapped command; its own commands go through the ordinary
+rewrite rules first, so wrapping costs no savings. The wrap always surfaces as
+an "ask" rewrite — never auto-allowed — because the script's content cannot be
 attested. It requires a resolvable `fish` binary, is disabled on Windows, and
 can be turned off with `wrap_fish_scripts = false` under `[hooks]` in the RTK
-config. Ambiguous scripts (shared `if`/`for` keywords without a fish-only
-marker, POSIX `then`/`do`/`fi` forms, heredocs, backticks) are untouched — keep
-writing intentionally shell-specific scripts as
+config.
+
+Untouched: ambiguous scripts (shared `if`/`for` keywords without a fish-only
+marker, POSIX `then`/`do`/`fi` forms, heredocs, backticks), and any script RTK
+could not decompose for the permission gate — command or process substitution,
+including fish's own `(cmd)`, and a redirect to a file. `for f in (ls) … end`
+falls in that last group. Keep writing intentionally shell-specific scripts as
 `rtk run --shell <shell> -c '<script>'`.
 
 ### Setup

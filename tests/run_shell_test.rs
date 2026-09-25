@@ -370,19 +370,32 @@ mod windows {
         assert!(String::from_utf8_lossy(&output.stdout).contains("windows_ok"));
     }
 
-    /// Arguments arriving on rtk's own command line keep their boundaries and
-    /// their quotes through `child_args` (#3728).
+    /// An argument carrying a `"` reaches a non-batch child with the encoding
+    /// MSYS/Cygwin and libuv children expect (`child_args`, #3728).
+    ///
+    /// `cmd.exe` is the wrong witness for this — it parses its own way and
+    /// echoes the encoding back verbatim — so the child here is `rtk` itself:
+    /// `rtk rewrite` prints the command string it received, which is only the
+    /// one that was sent if the quote survived re-encoding on both sides.
     #[test]
     fn quoted_arguments_reach_the_child_intact() {
+        let home = tempfile::tempdir().expect("create isolated home");
         let output = rtk()
-            .args(["run", "cmd", "/C", "echo", "a b", "c\"d"])
+            .args([
+                "run",
+                env!("CARGO_BIN_EXE_rtk"),
+                "rewrite",
+                "git status \"a b\"",
+            ])
+            .env("HOME", home.path())
+            .env("USERPROFILE", home.path())
+            .env("XDG_CONFIG_HOME", home.path())
+            .env("RTK_TELEMETRY_DISABLED", "1")
             .output()
             .expect("run rtk run");
 
-        assert!(output.status.success());
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("a b"), "{stdout}");
-        assert!(stdout.contains("c\"d"), "{stdout}");
+        assert_eq!(stdout.trim_end(), "rtk git status \"a b\"", "{stdout}");
     }
 
     #[test]

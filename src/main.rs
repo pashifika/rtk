@@ -244,7 +244,7 @@ enum Commands {
         #[arg(long, value_name = "SHELL")]
         shell: Option<String>,
         /// Command to run
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
     },
 
@@ -338,7 +338,7 @@ enum Commands {
         #[arg(long, value_name = "SHELL")]
         shell: Option<String>,
         /// Command to run and summarize
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
     },
 
@@ -1582,9 +1582,14 @@ fn run_fallback(parse_error: clap::Error) -> Result<i32> {
     // that list — but a misused `--shell` is RTK's own flag, not something to
     // hand to `test`. Without this, `rtk test --shell` execs the real `test`
     // with no arguments and exits 0, silently ignoring the request (#4125).
-    if args
-        .iter()
-        .any(|arg| arg == "--shell" || arg.starts_with("--shell="))
+    //
+    // Scoped to `test` alone: `--shell` is a flag other tools carry too, and an
+    // argv-wide scan would refuse to run `just --shell bash` or
+    // `hyperfine --shell=none` — including the spellings the hook itself emits.
+    if args[0] == "test"
+        && args
+            .iter()
+            .any(|arg| arg == "--shell" || arg.starts_with("--shell="))
     {
         parse_error.exit();
     }
@@ -1967,24 +1972,53 @@ fn is_native_test_expression(command: &[String]) -> bool {
 /// prefixes. A command behind them is not a native expression, so it runs
 /// through the test filter — and the negation and grouping the joined `sh -c`
 /// string used to get from the shell have to come from somewhere.
+///
+/// They nest, so they are stripped in one loop until neither applies: a single
+/// pass of each leaves `! ( cmd )` with `(` as its program, which is not found
+/// — and the negation would then turn that 127 into a reported *pass* for a
+/// command that never ran.
 fn split_leading_negations(command: Vec<String>) -> (usize, Vec<String>) {
     let mut command = command;
+    let mut negations = 0;
 
-    // `( cmd )` groups; the subshell it asked for buys nothing here, since the
-    // command runs in its own process either way.
-    if command.len() > 2
-        && command.first().is_some_and(|token| token == "(")
-        && command.last().is_some_and(|token| token == ")")
-    {
-        command = command[1..command.len() - 1].to_vec();
+    loop {
+        let bangs = command.iter().take_while(|token| *token == "!").count();
+        // All `!` and nothing to negate: leave it alone so the runner reports it.
+        if bangs > 0 && bangs < command.len() {
+            negations += bangs;
+            command = command[bangs..].to_vec();
+            continue;
+        }
+        if let Some(grouped) = strip_outer_group(&command) {
+            command = grouped;
+            continue;
+        }
+        return (negations, command);
+    }
+}
+
+/// Peel one `( … )` that wraps the whole command.
+///
+/// The parentheses must balance across the command, so `( a ) b ( c )` — where
+/// the first `(` closes before the end — keeps both of them.
+fn strip_outer_group(command: &[String]) -> Option<Vec<String>> {
+    if command.len() <= 2 || command.first()? != "(" || command.last()? != ")" {
+        return None;
     }
 
-    let negations = command.iter().take_while(|token| *token == "!").count();
-    // All `!` and nothing to negate: leave it alone so the runner reports it.
-    if negations == command.len() {
-        return (0, command);
+    let mut depth = 0usize;
+    for (index, token) in command.iter().enumerate() {
+        match token.as_str() {
+            "(" => depth += 1,
+            ")" => depth = depth.checked_sub(1)?,
+            _ => {}
+        }
+        if depth == 0 && index + 1 < command.len() {
+            return None;
+        }
     }
-    (negations, command[negations..].to_vec())
+
+    (depth == 0).then(|| command[1..command.len() - 1].to_vec())
 }
 
 /// `--shell` runs one complete script, so it takes exactly one positional.
@@ -2002,9 +2036,14 @@ fn require_single_script(subcommand: &str, shell: Option<&str>, command: &[Strin
     }
 
     let mut cli = Cli::command();
-    let surface = cli
+    let mut surface = cli
         .find_subcommand_mut(subcommand)
-        .expect("every caller names its own subcommand");
+        .expect("every caller names its own subcommand")
+        .clone()
+        // Taken on its own, the subcommand's usage line reads `test …` — the
+        // name of the POSIX utility `rtk test` shadows. Spell the binary the
+        // caller actually typed.
+        .bin_name(format!("rtk {subcommand}"));
     surface
         .error(
             ErrorKind::WrongNumberOfValues,

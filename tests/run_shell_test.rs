@@ -331,19 +331,29 @@ mod unix {
 
     #[test]
     fn grouped_and_negated_commands_keep_their_exit_codes() {
-        // `!` and `( … )` are `test`'s syntax as much as the shell's; the joined
-        // `sh -c` string used to apply both.
+        // `!` and `( … )` are `test`'s syntax as much as the shell's, and they
+        // nest: the joined `sh -c` string used to apply both. Stripping one of
+        // each in a single pass left `(` as the program, so a negation turned
+        // that 127 into a reported *pass* for a command that never ran.
         for (args, expected) in [
             (vec!["test", "!", "false"], 0),
             (vec!["test", "!", "true"], 1),
             (vec!["test", "(", "false", ")"], 1),
             (vec!["test", "(", "!", "false", ")"], 0),
+            (vec!["test", "!", "(", "true", ")"], 1),
+            (vec!["test", "!", "(", "false", ")"], 0),
+            (vec!["test", "(", "(", "false", ")", ")"], 1),
+            (vec!["test", "!", "!", "(", "true", ")"], 0),
         ] {
             let output = rtk()
                 .args(&args)
                 .output()
                 .unwrap_or_else(|e| panic!("run rtk {args:?}: {e}"));
             assert_eq!(output.status.code(), Some(expected), "{args:?}");
+            assert!(
+                !String::from_utf8_lossy(&output.stdout).contains("command not found"),
+                "{args:?} must run the command, not report it missing"
+            );
         }
     }
 }

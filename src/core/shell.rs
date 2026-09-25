@@ -73,6 +73,12 @@ fn classify_unrunnable(program: &str) -> Unrunnable {
     match std::fs::metadata(program) {
         Ok(meta) if meta.is_dir() => Unrunnable::not_executable(program, "Is a directory"),
         Ok(_) => Unrunnable::not_executable(program, "Permission denied"),
+        // A directory on the way is unsearchable, so whether the program exists
+        // was never established — 127 would assert what the call could not
+        // answer. `dash` reports 126 here.
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            Unrunnable::not_executable(program, "Permission denied")
+        }
         Err(_) => Unrunnable::not_found(program),
     }
 }
@@ -94,10 +100,16 @@ pub fn spawn_failure(program: &str, error: &anyhow::Error) -> Option<Unrunnable>
         .chain()
         .find_map(|cause| cause.downcast_ref::<std::io::Error>())?;
 
-    // ENOEXEC: not a recognized executable format. It has no stable
-    // `ErrorKind`, so it is matched on the raw code where one exists.
-    const ENOEXEC: i32 = 8;
-    if io_error.raw_os_error() == Some(ENOEXEC) {
+    // "Not a recognized executable format" has no stable `ErrorKind`, so it is
+    // matched on the raw code — which is per-platform: 8 is ENOEXEC on Unix,
+    // while on Windows `raw_os_error` is a Win32 code, 8 there is
+    // ERROR_NOT_ENOUGH_MEMORY, and the bad-format code is 193.
+    #[cfg(unix)]
+    const BAD_FORMAT: i32 = 8;
+    #[cfg(windows)]
+    const BAD_FORMAT: i32 = 193;
+    #[cfg(any(unix, windows))]
+    if io_error.raw_os_error() == Some(BAD_FORMAT) {
         return Some(Unrunnable::not_executable(
             program,
             "cannot execute binary file",
@@ -168,10 +180,14 @@ pub fn command_from_args(args: &[String], shell: Option<&str>) -> Result<Launch>
 }
 
 /// The program a launch would have executed, for the message a failure carries.
+///
+/// Without `--shell`, a command string runs through the platform default, so
+/// that is the program a failure is about — naming it beats the placeholder a
+/// caller has no way to see otherwise.
 pub fn program_name<'a>(args: &'a [String], shell: Option<&'a str>) -> &'a str {
     shell
         .or_else(|| args.first().map(String::as_str))
-        .unwrap_or("command")
+        .unwrap_or(default_shell())
 }
 
 /// Render argv for logging, tracking labels and ecosystem detection.

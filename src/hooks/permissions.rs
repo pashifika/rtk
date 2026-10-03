@@ -166,10 +166,15 @@ fn check_shell_wrapper_permissions(
             return Some(PermissionVerdict::Ask);
         };
         contains_shell_wrapper = true;
+        // Both spellings, exactly as the outer loop above: a segment can open
+        // with grammar that is not part of the command (`! rm …`, `{ rm …`),
+        // and a rule naming the command has to reach it there too.
         let inner_denied = split_for_permissions(script).iter().any(|inner_segment| {
-            deny_rules
-                .iter()
-                .any(|pattern| command_matches_pattern(inner_segment.trim(), pattern))
+            let inner_segment = inner_segment.trim();
+            deny_rules.iter().any(|pattern| {
+                command_matches_pattern(inner_segment, pattern)
+                    || command_matches_pattern(strip_grammar_residue(inner_segment), pattern)
+            })
         });
         if inner_denied {
             return Some(PermissionVerdict::Deny);
@@ -1429,6 +1434,34 @@ mod tests {
                 &[],
                 &allow
             ),
+            PermissionVerdict::Deny
+        );
+    }
+
+    /// A segment of the inner script can open with grammar that is not part of
+    /// the command. The outer gate strips it before matching; so must the
+    /// wrapper's own check, or `bash -c 'git status; ! rm …'` is rewritten
+    /// while `bash -c 'git status && (rm …)'` and the same commands unwrapped
+    /// are denied.
+    #[test]
+    fn test_shell_wrapper_inner_deny_sees_through_grammar() {
+        let deny = vec!["rm:*".to_string()];
+        let allow = vec!["*".to_string()];
+        for cmd in [
+            "bash -c 'git status; ! rm -rf /tmp/example'",
+            "bash -c 'git status && { rm -rf /tmp/example; }'",
+            "sh -c 'git status; ! rm -rf /tmp/example'",
+        ] {
+            assert_eq!(
+                check_command_with_rules(cmd, &deny, &[], &allow),
+                PermissionVerdict::Deny,
+                "{cmd:?}"
+            );
+        }
+        // The grammar itself names no command, so a script without a denied
+        // one is unaffected.
+        assert_ne!(
+            check_command_with_rules("bash -c 'git status; ! cargo test'", &deny, &[], &allow),
             PermissionVerdict::Deny
         );
     }

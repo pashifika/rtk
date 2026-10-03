@@ -8,11 +8,13 @@ use super::lexer::ShellDialect;
 /// `fish` is here because the wrapper *names* the shell: the script's dialect
 /// is known, so [`ShellDialect::Fish`] rules can be applied to it alone, and
 /// fish's own syntax (`(cmd)` substitution, `and`/`or`/`end` control flow)
-/// defers instead of being rewritten under bash assumptions.
+/// defers instead of being rewritten under bash assumptions. `zsh` is named
+/// for one shape: `&|` and `&!` are single operators there, and a rewrite that
+/// re-emits either spaced changes what the script runs.
 const SUPPORTED_SHELLS: &[(&str, ShellDialect)] = &[
     ("sh", ShellDialect::Posix),
     ("bash", ShellDialect::Posix),
-    ("zsh", ShellDialect::Posix),
+    ("zsh", ShellDialect::Zsh),
     ("fish", ShellDialect::Fish),
 ];
 

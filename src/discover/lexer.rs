@@ -470,6 +470,10 @@ fn flush_arg(tokens: &mut Vec<ParsedToken>, current: &mut String, offset: usize)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ShellDialect {
     Posix,
+    /// Bash-compatible for everything RTK reads except the pair `&` opens:
+    /// `&|` and `&!` both background-and-disown in zsh, and this lexer reads
+    /// them as two tokens.
+    Zsh,
     Fish,
 }
 
@@ -498,6 +502,15 @@ pub(crate) fn contains_unattestable_construct_in(cmd: &str, dialect: ShellDialec
     if ansi_c_quote_defeats_lexer(cmd) {
         return true;
     }
+    // `&|` and `&!` are one operator to the shell that names itself. This
+    // lexer reads them as a background `&` plus a pipe or a negation, and the
+    // rewrite re-emits the two spaced — `cmd & | …`, `cmd & ! …` — which zsh
+    // refuses to parse or silently turns into a different command. Bash has
+    // neither operator (`a &| b` is a syntax error spaced or not), so the
+    // Posix dialect keeps the rewrite it has always had.
+    if dialect != ShellDialect::Posix && opens_disown_pair(cmd) {
+        return true;
+    }
     // The fish check needs newlines as boundaries, so a keyword opening a line
     // is at command position; the redirect scan below keeps the bash-shaped
     // tokens it has always used, where a newline is part of the word.
@@ -522,20 +535,14 @@ fn contains_fish_only_construct(tokens: &[ParsedToken]) -> bool {
         "function",
     ];
 
+    // `&|` pipes stdout and stderr in fish, and the rewrite would re-emit the
+    // two spaced, which fish rejects outright — so leave the script alone.
+    if disown_pair(tokens) {
+        return true;
+    }
+
     let mut command_position = true;
-    // Byte just past a `&` token, to spot the `&|` pair below.
-    let mut ampersand_end = None;
     for token in tokens {
-        // `&|` pipes stdout and stderr in fish. This lexer reads it as a
-        // background `&` followed by a pipe, and the rewrite re-emits the two
-        // spaced, which fish rejects outright — so leave the script alone.
-        if matches!(token.kind, TokenKind::Pipe(_)) && ampersand_end == Some(token.offset) {
-            return true;
-        }
-        ampersand_end = match &token.kind {
-            TokenKind::Shellism if token.value == "&" => Some(token.offset + token.value.len()),
-            _ => None,
-        };
         match token.kind {
             TokenKind::Shellism if matches!(token.value.as_str(), "(" | ")") => return true,
             TokenKind::Operator | TokenKind::Pipe(_) => command_position = true,
@@ -550,6 +557,36 @@ fn contains_fish_only_construct(tokens: &[ParsedToken]) -> bool {
         }
     }
 
+    false
+}
+
+/// True for the pair `&` opens when the next token is glued to it: `&|` in
+/// fish and zsh, `&!` in zsh. Each is one operator to the shell that named
+/// itself and two tokens to this lexer, so a rewrite that re-emits them
+/// spaced hands that shell something it reads differently.
+fn opens_disown_pair(cmd: &str) -> bool {
+    disown_pair(&tokenize_inner(cmd, NewlineMode::Conservative))
+}
+
+fn disown_pair(tokens: &[ParsedToken]) -> bool {
+    // Byte just past a `&` token, so the pair is spotted by adjacency.
+    let mut ampersand_end = None;
+    for token in tokens {
+        let glued = ampersand_end == Some(token.offset);
+        let pairs = match &token.kind {
+            TokenKind::Pipe(_) => true,
+            TokenKind::Shellism => token.value == "!",
+            TokenKind::Arg => token.value.starts_with('!'),
+            _ => false,
+        };
+        if glued && pairs {
+            return true;
+        }
+        ampersand_end = match &token.kind {
+            TokenKind::Shellism if token.value == "&" => Some(token.offset + token.value.len()),
+            _ => None,
+        };
+    }
     false
 }
 
@@ -1688,6 +1725,39 @@ mod tests {
             "git status & cargo test",
             ShellDialect::Fish
         ));
+    }
+
+    /// zsh reads `&|` and `&!` as one operator each — background and disown —
+    /// and the rewrite re-emits the two spaced. `cmd & | …` is a parse error
+    /// there, and `cmd & ! …` silently becomes a negated command, so a failing
+    /// script reports success. Bash has neither operator (`a &| b` is a syntax
+    /// error spaced or not), so the Posix dialect keeps the rewrite it had.
+    #[test]
+    fn test_zsh_dialect_refuses_the_pairs_an_ampersand_opens() {
+        for script in [
+            "cargo build &| tail -3",
+            "cargo build&|tail -3",
+            "ls &! ls /nonexistent",
+            "ls&!ls /nonexistent",
+            "ls &!",
+        ] {
+            assert!(
+                contains_unattestable_construct_in(script, ShellDialect::Zsh),
+                "zsh pair must not be attested: {script:?}"
+            );
+            assert!(
+                !contains_unattestable_construct_in(script, ShellDialect::Posix),
+                "bash reads no such operator: {script:?}"
+            );
+        }
+        // A background `&` with a command of its own is untouched, and so is a
+        // `!` that starts a command rather than following a `&`.
+        for script in ["sleep 1 & git status", "! git status", "git status | cat"] {
+            assert!(
+                !contains_unattestable_construct_in(script, ShellDialect::Zsh),
+                "ordinary zsh script must stay attestable: {script:?}"
+            );
+        }
     }
 
     #[test]

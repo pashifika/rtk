@@ -23,15 +23,6 @@ pub enum PermissionVerdict {
     Default,
 }
 
-/// Check `cmd` against Claude Code's deny/ask/allow permission rules.
-///
-/// Precedence: Deny > Ask > Allow > Default (ask).
-/// Returns `Default` when no rules match — callers should treat this as ask
-/// to match Claude Code's least-privilege default.
-pub fn check_command(cmd: &str) -> PermissionVerdict {
-    check_command_for(cmd, Host::Claude)
-}
-
 /// The agent host whose own permission settings should be consulted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Host {
@@ -454,6 +445,31 @@ fn strip_grammar_residue(segment: &str) -> &str {
         }
         rest = next;
     }
+}
+
+/// True when a deny rule matches a run of words starting anywhere in `words`.
+///
+/// The segmenters model bash: they split a command into the places *bash*
+/// starts one. A fish script has more of them — the condition of an `if` or a
+/// `while`, the right side of `and`/`or`/`not` — so a command RTK is about to
+/// hand to a fish can sit where no segmenter looks. Rather than enumerate
+/// fish's grammar, every word is treated as a possible command start and the
+/// gate's own matcher is asked about each run.
+///
+/// Deny only, and only for a decision that would otherwise *add* reach (the
+/// fish wrap): matching this loosely against an allow rule would approve
+/// commands no rule named.
+pub(crate) fn deny_matches_any_word_run(words: &[String], deny_rules: &[String]) -> bool {
+    if deny_rules.is_empty() {
+        return false;
+    }
+
+    (0..words.len()).any(|start| {
+        let run = words[start..].join(" ");
+        deny_rules
+            .iter()
+            .any(|pattern| command_matches_pattern(&run, pattern))
+    })
 }
 
 /// Pattern forms:

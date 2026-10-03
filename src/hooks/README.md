@@ -90,15 +90,18 @@ disambiguator anywhere, comments excluded before anything is classified) are
 rewritten to `rtk run --shell fish -c '<script>'` (`discover/fish_script.rs`),
 with the script's own commands rewritten inside the wrap so it costs no
 savings. Like wrapper rewrites, the wrapped form is never auto-allowed — its
-strongest verdict is `Ask`. A deny rule keeps the wrap off entirely: because
-the wrap hands the script to a *different* shell, and fish starts commands
-where the bash-shaped segmenter does not look (the condition of an `if` or a
-`while`, the right side of `and`/`or`/`not`), every word of the script is
-treated as a possible command start and checked against the host's own deny
-rules before wrapping. The wrap is
-skipped without a resolvable `fish` binary, on Windows, or when
-`hooks.wrap_fish_scripts = false`; those cases take the decision path they
-always did.
+strongest verdict is `Ask`, for every host, including a delegate that owns
+approval (`ApprovalOwner`): the verdict behind a wrap was read as bash, so
+`Default` there means no rule was *read*, not that none matched. A deny rule
+keeps the wrap off entirely: because the wrap hands the script to a
+*different* shell, and fish starts commands where the bash-shaped segmenter
+does not look (the condition of an `if` or a `while`, the right side of
+`and`/`or`/`not`), every word of the script is treated as a possible command
+start and checked against the host's own deny rules before wrapping — both as
+the host submitted it and as RTK would emit it, since the inner rewrite
+inserts commands of its own. The wrap is skipped without a resolvable `fish`
+binary, on Windows, or when `hooks.wrap_fish_scripts = false`; those cases
+take the decision path they always did.
 
 **Why it runs before the unattestable gate.** Every other rewrite refuses a
 command the gate could not decompose. The wrap cannot wait for that gate and
@@ -108,7 +111,9 @@ means the command is lost rather than merely unrewritten. What it does instead
 is refuse everything that gate refuses — command and process substitution,
 file-target redirects, and fish's own `(cmd)` substitution, which the shared
 bash lexer reads as a subshell — reading the same comment-stripped text the
-classification uses, so a quote in a comment cannot blind it. The only scripts
+classification uses, so a quote in a comment cannot blind it. It also refuses
+fish's `&|` pipe, which that lexer reads as a background `&` plus a pipe and
+the rewrite re-emits spaced, a form fish rejects outright. The only scripts
 that reach the wrap are ones whose sole unattestable property is fish control
 flow (`; and`, `if … end`), which the shared segmenter cannot split into
 commands. For those:
@@ -117,8 +122,14 @@ commands. For those:
   its contents beyond the rewrite rules it applies to them — those rules are
   the one edit it makes, so the argument carries the same commands rather than
   the same bytes;
-- the verdict is `Ask`, never `Allow`, and a deny rule keeps the wrap off
-  wherever it matches a run of words in the script, in any placement;
+- the verdict is `Ask`, never `Allow` and never relaxed, and a deny rule keeps
+  the wrap off wherever it matches a run of words in the script, in any
+  placement. The words are read as one command's argv — grouped by command
+  separator, with a redirect removed rather than truncated at, dequoted, and
+  compared against each rule both as written and dequoted. Where they cannot be
+  read as fish would read them — a word carrying `$`, `{`, `*`, `[`, `~`, a
+  backslash escape or a `\r` outside single quotes, all of which fish resolves
+  at run time — the wrap is withheld rather than cleared;
 - the residual exposure is a host that treats an `rtk`-prefixed command as
   pre-approved. Codex does: it renders `Ask` as a protocol-level `allow` and
   its own safe/dangerous classifiers do not unwrap `rtk` (see `hook_cmd.rs`).

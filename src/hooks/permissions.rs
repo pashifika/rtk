@@ -36,16 +36,14 @@ pub enum Host {
     Antigravity,
 }
 
-pub fn check_command_for(cmd: &str, host: Host) -> PermissionVerdict {
-    let (deny_rules, ask_rules, allow_rules) = load_rules_for(host);
-    check_command_with_rules(cmd, &deny_rules, &ask_rules, &allow_rules)
-}
-
 /// Load `host`'s deny/ask/allow Bash rules from disk, doing the settings-file I/O
-/// exactly once. Exposed so a caller that checks many commands against the same
-/// host in a loop (e.g. `rtk discover` scanning thousands of transcript commands)
-/// can load once up front and reuse `check_command_with_rules` per command instead
-/// of going through `check_command_for` and re-reading every settings file from
+/// exactly once.
+///
+/// Every caller reads its rules through here and keeps them: a verdict needs
+/// all three, the fish wrap needs the deny side (`hooks::decision`), and a
+/// caller that checks many commands against the same host in a loop (e.g.
+/// `rtk discover` scanning thousands of transcript commands) reuses them per
+/// command instead of re-reading every settings file from
 /// disk on every single call.
 pub(crate) fn load_rules_for(host: Host) -> (Vec<String>, Vec<String>, Vec<String>) {
     match host {
@@ -447,7 +445,7 @@ fn strip_grammar_residue(segment: &str) -> &str {
     }
 }
 
-/// True when a deny rule matches a run of words starting anywhere in `words`.
+/// True when a deny rule matches a run of words anywhere in `segments`.
 ///
 /// The segmenters model bash: they split a command into the places *bash*
 /// starts one. A fish script has more of them — the condition of an `if` or a
@@ -456,20 +454,178 @@ fn strip_grammar_residue(segment: &str) -> &str {
 /// fish's grammar, every word is treated as a possible command start and the
 /// gate's own matcher is asked about each run.
 ///
+/// Both ends move. A rule is free to anchor its tail (`echo * DENIED`), so a
+/// run that always extends to the end of the script would match no such rule
+/// the moment anything follows it. Runs stay inside one segment, which is why
+/// the caller groups the words per segment: a run spanning `;` would be an
+/// argv no shell ever assembles, and the words either side belong to different
+/// commands.
+///
 /// Deny only, and only for a decision that would otherwise *add* reach (the
 /// fish wrap): matching this loosely against an allow rule would approve
 /// commands no rule named.
-pub(crate) fn deny_matches_any_word_run(words: &[String], deny_rules: &[String]) -> bool {
-    if deny_rules.is_empty() {
+pub(crate) fn deny_matches_any_word_run(segments: &[Vec<String>], deny_rules: &[String]) -> bool {
+    // Each rule is also tried with its own quotes removed. The words arrive
+    // dequoted — that is what makes `'rm'` match a rule naming `rm` — so a rule
+    // the user wrote quoted (`echo "DENIED"`) would otherwise match the command
+    // in its unwrapped form, where the gate compares raw text, and miss it
+    // here. An empty pattern names nothing and is dropped; without that, an
+    // empty rule matches an empty argument exactly and stops an unrelated
+    // script.
+    let mut spellings: Vec<String> = Vec::with_capacity(deny_rules.len() * 2);
+    for rule in deny_rules {
+        let dequoted = crate::discover::lexer::shell_split(rule).join(" ");
+        for spelling in [rule.clone(), dequoted] {
+            if !spelling.is_empty() && !spellings.contains(&spelling) {
+                spellings.push(spelling);
+            }
+        }
+    }
+    let patterns: Vec<PatternReach> = spellings.iter().map(|p| PatternReach::of(p)).collect();
+    if patterns.is_empty() {
         return false;
     }
 
-    (0..words.len()).any(|start| {
-        let run = words[start..].join(" ");
-        deny_rules
-            .iter()
-            .any(|pattern| command_matches_pattern(&run, pattern))
+    segments.iter().any(|words| {
+        (0..words.len()).any(|start| {
+            if words[start].is_empty() {
+                return false;
+            }
+            patterns
+                .iter()
+                .any(|pattern| pattern.matches_run_at(&words[start..]))
+        })
     })
+}
+
+/// How much of a command a deny pattern can possibly read.
+///
+/// Every form [`command_matches_pattern`] accepts is anchored at the start of
+/// the command, and all but one are *only* a prefix comparison. Knowing which
+/// is which is what keeps this gate linear in the length of a script: a rule
+/// like `rm:*` is answered by two words however long the script is, instead of
+/// re-reading every run of words that starts with them.
+enum PatternReach {
+    /// `*`, or a wildcard with nothing in front of it: any command matches.
+    Everything,
+    /// A prefix comparison (`rm:*`, `git push *`, or a wildcard-free rule):
+    /// only the first `words` words of the command can matter.
+    Head { pattern: String, words: usize },
+    /// A wildcard with text on both sides (`echo * DENIED`): the whole command
+    /// matters, and the command may end before the segment does — so the run
+    /// is also tried with a tail the pattern leaves open.
+    ///
+    /// `anchor` is the literal the glob requires at the front of the command,
+    /// with the number of words that can hold it. Testing that first is what
+    /// keeps a long script cheap: the run is assembled only where the glob
+    /// could still match.
+    Whole {
+        pattern: String,
+        open_tail: String,
+        anchor: String,
+        anchor_words: usize,
+    },
+}
+
+impl PatternReach {
+    /// Classify `pattern` exactly as [`command_matches_pattern`] branches on
+    /// it; the two must stay in step, so the branch order is the same.
+    fn of(pattern: &str) -> Self {
+        let normalized = normalize_command_text(pattern);
+        let count = |text: &str| {
+            text.split(is_word_boundary_whitespace)
+                .filter(|part| !part.is_empty())
+                .count()
+        };
+        if normalized == "*" {
+            return Self::Everything;
+        }
+        if let Some(p) = normalized.strip_suffix('*') {
+            let prefix = p.trim_end_matches(':').trim_end();
+            if prefix.is_empty() || prefix == "*" {
+                return Self::Everything;
+            }
+            if !prefix.contains('*') {
+                return Self::Head {
+                    pattern: normalized.clone(),
+                    words: count(prefix).max(1),
+                };
+            }
+        }
+        if normalized.contains('*') {
+            // `glob_matches` normalizes the colon forms and anchors the text
+            // before the first `*` at the start of the command.
+            let colon_normalized = normalized.replace(":*", " *").replace("*:", "* ");
+            let anchor = colon_normalized
+                .split('*')
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            return Self::Whole {
+                // ` *` lets the pattern's own tail land on any word boundary,
+                // which is how a command that stops before the end of the
+                // segment is matched without assembling every run separately.
+                open_tail: format!("{normalized} *"),
+                pattern: normalized,
+                // One word more than the anchor names, since the anchor may
+                // end inside a word (`ec*ho`) or on a space (`git -C `).
+                anchor_words: count(&anchor) + 1,
+                anchor,
+            };
+        }
+        Self::Head {
+            words: count(&normalized).max(1),
+            pattern: normalized,
+        }
+    }
+
+    /// True when a command starting at the front of `words` matches.
+    fn matches_run_at(&self, words: &[String]) -> bool {
+        match self {
+            Self::Everything => true,
+            Self::Head { pattern, words: n } => {
+                let head = normalize_command_text(&words[..(*n).min(words.len())].join(" "));
+                command_matches_pattern(&head, pattern)
+            }
+            Self::Whole {
+                pattern,
+                open_tail,
+                anchor,
+                anchor_words,
+            } => {
+                if !anchor.is_empty() {
+                    let probe = normalize_command_text(
+                        &words[..(*anchor_words).min(words.len())].join(" "),
+                    );
+                    if !probe.starts_with(anchor.as_str()) {
+                        return false;
+                    }
+                }
+                let run = words.join(" ");
+                command_matches_pattern(&run, pattern) || command_matches_pattern(&run, open_tail)
+            }
+        }
+    }
+}
+
+/// One space between words, line continuations elided.
+///
+/// Shares the lexer's word-boundary definition rather than
+/// `str::split_whitespace()`, so a bare `\r` in a command never collapses into
+/// a space.
+///
+/// A line continuation goes first: bash elides `\<newline>` entirely and joins
+/// the words either side, so splitting on the newline alone would leave a
+/// stray `\` in front of the command that no pattern matches. Only the LF
+/// form: against CRLF the backslash escapes the `\r` and the `\n` still
+/// terminates the command, in bash and in the lexer alike, so the words either
+/// side are already separate segments.
+fn normalize_command_text(text: &str) -> String {
+    text.replace("\\\n", "")
+        .split(is_word_boundary_whitespace)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Pattern forms:
@@ -478,25 +634,8 @@ pub(crate) fn deny_matches_any_word_run(words: &[String], deny_rules: &[String])
 /// - `* suffix`, `pre * suf` → glob matching where `*` matches any sequence of characters
 /// - `pattern` → exact match or prefix match (cmd must equal pattern or start with `{pattern} `)
 pub(crate) fn command_matches_pattern(cmd: &str, pattern: &str) -> bool {
-    // Shares the lexer's word-boundary definition rather than
-    // str::split_whitespace(), so a bare `\r` in `cmd` never collapses into a space.
-    //
-    // A line continuation is removed first: bash elides `\<newline>` entirely
-    // and joins the words either side, so splitting on the newline alone would
-    // leave a stray `\` in front of the command that no pattern matches.
-    //
-    // Only the LF form: against CRLF the backslash escapes the `\r` and the
-    // `\n` still terminates the command, in bash and in the lexer alike, so
-    // the words either side are already separate segments.
-    let normalize = |s: &str| {
-        s.replace("\\\n", "")
-            .split(is_word_boundary_whitespace)
-            .filter(|part| !part.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ")
-    };
-    let cmd_norm = normalize(cmd);
-    let pattern_norm = normalize(pattern);
+    let cmd_norm = normalize_command_text(cmd);
+    let pattern_norm = normalize_command_text(pattern);
     let cmd = cmd_norm.as_str();
     let pattern = pattern_norm.as_str();
 
@@ -589,6 +728,96 @@ fn split_compound_command(cmd: &str) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every contiguous run of words, matched the obvious way. The reference
+    /// [`deny_matches_any_word_run`] is an optimisation of.
+    fn deny_matches_brute_force(segments: &[Vec<String>], deny_rules: &[String]) -> bool {
+        let spellings: Vec<String> = deny_rules
+            .iter()
+            .flat_map(|rule| {
+                let dequoted = crate::discover::lexer::shell_split(rule).join(" ");
+                [rule.clone(), dequoted]
+            })
+            .filter(|spelling| !spelling.is_empty())
+            .collect();
+        segments.iter().any(|words| {
+            (0..words.len()).any(|start| {
+                (start + 1..=words.len()).any(|end| {
+                    let run = words[start..end].join(" ");
+                    spellings
+                        .iter()
+                        .any(|pattern| command_matches_pattern(&run, pattern))
+                })
+            })
+        })
+    }
+
+    /// The shapes the two are compared over: every word list up to three words
+    /// long, against rules covering each branch of
+    /// [`command_matches_pattern`].
+    fn equivalence_corpus(alphabet: &[&str]) -> Vec<Vec<Vec<String>>> {
+        let mut lists: Vec<Vec<String>> = Vec::new();
+        for a in alphabet {
+            lists.push(vec![a.to_string()]);
+            for b in alphabet {
+                lists.push(vec![a.to_string(), b.to_string()]);
+                for c in alphabet {
+                    lists.push(vec![a.to_string(), b.to_string(), c.to_string()]);
+                }
+            }
+        }
+        lists.into_iter().map(|words| vec![words]).collect()
+    }
+
+    const EQUIVALENCE_RULES: &[&str] = &[
+        "*",
+        "echo",
+        "rm:*",
+        "git push:*",
+        "echo * DENIED",
+        "echo *IED",
+        "ec*ho",
+        "git -C * diff:*",
+        " echo * DENIED ",
+        "echo\tDENIED",
+        "echo 'DENIED'",
+    ];
+
+    /// `PatternReach` decides how many words each rule can need, so it must
+    /// answer exactly what reading every run answers — for words that are
+    /// words, which is what [`fish_script::code_word_runs`] produces (it drops
+    /// the empty ones).
+    #[test]
+    fn deny_run_matching_matches_the_brute_force_reference() {
+        for segments in equivalence_corpus(&["echo", "DENIED", "rm", "git", "push"]) {
+            for rule in EQUIVALENCE_RULES {
+                let rules = vec![rule.to_string()];
+                assert_eq!(
+                    deny_matches_any_word_run(&segments, &rules),
+                    deny_matches_brute_force(&segments, &rules),
+                    "{rule:?} against {segments:?}"
+                );
+            }
+        }
+    }
+
+    /// A word carrying a space of its own (`echo 'a b'`) blurs the boundary
+    /// the open-tail spelling relies on, so the two can disagree — but only
+    /// one way. A rule that matches must still match; refusing a wrap nobody
+    /// asked to refuse costs a rewrite, missing one costs the guarantee.
+    #[test]
+    fn deny_run_matching_never_misses_what_the_reference_finds() {
+        for segments in equivalence_corpus(&["echo", "DENIED extra", "A DENIED", "rm -rf"]) {
+            for rule in EQUIVALENCE_RULES {
+                let rules = vec![rule.to_string()];
+                assert!(
+                    !deny_matches_brute_force(&segments, &rules)
+                        || deny_matches_any_word_run(&segments, &rules),
+                    "{rule:?} against {segments:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_get_settings_paths_uses_the_resolved_claude_dir() {

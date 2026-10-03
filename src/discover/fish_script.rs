@@ -28,9 +28,13 @@ const POSIX_ONLY_KEYWORDS: &[&str] = &["then", "fi", "do", "done", "esac", "elif
 ///
 /// Returns `None` (caller keeps its defer behavior) when the script is not
 /// provably fish, when the command already delegates (`rtk …` or an explicit
-/// shell `-c` wrapper), when the script contains a fish-divergent backslash
-/// sequence (`\\` or `\'`), on Windows, when `hooks.wrap_fish_scripts` is
-/// disabled, or when no `fish` binary is resolvable.
+/// shell `-c` wrapper), when the comment scan refuses because the two shells
+/// disagree where a comment starts, when the permission gate could not
+/// decompose the script (substitution, a file-target redirect) or it carries
+/// fish's own `(cmd)` substitution or `&|` pipe, when the script contains a
+/// fish-divergent backslash sequence (`\\` or `\'`), on Windows, when
+/// `hooks.wrap_fish_scripts` is disabled, or when no `fish` binary is
+/// resolvable.
 ///
 /// The cheap, pure classification runs first; the config read and the `fish`
 /// PATH probe run only once the command is classified fish. So common non-fish
@@ -39,11 +43,7 @@ const POSIX_ONLY_KEYWORDS: &[&str] = &["then", "fi", "do", "done", "esac", "elif
 pub fn try_wrap(cmd: &str) -> Option<String> {
     try_wrap_with_probes(
         cmd,
-        || {
-            crate::core::config::Config::load()
-                .map(|c| c.hooks.wrap_fish_scripts)
-                .unwrap_or(true)
-        },
+        || crate::core::config::cached_config().hooks.wrap_fish_scripts,
         || crate::core::utils::resolve_binary("fish").is_ok(),
     )
 }
@@ -94,6 +94,16 @@ fn try_wrap_with_probes(
     if lexer::contains_unattestable_construct(&code) || contains_fish_substitution(&code) {
         return None;
     }
+    // `&|` pipes stdout and stderr in fish, and `&` opens the same kind of
+    // pair in zsh. The shared lexer reads each as a background `&` followed by
+    // a pipe or a negation, so the inner rewrite re-emits the two spaced —
+    // `rtk git status & | cat` — which fish rejects outright. The wrap
+    // promises the argument carries the same commands, so a script RTK cannot
+    // rewrite without changing what it runs is left alone, exactly as the
+    // `fish -c` wrapper path leaves it.
+    if lexer::opens_disown_pair(&code) {
+        return None;
+    }
     // Fish single-quoted strings diverge from POSIX single-quote semantics for
     // exactly two sequences: `\\` collapses to one backslash and `\'` becomes a
     // literal quote (a backslash before any other character is literal in both).
@@ -122,16 +132,187 @@ pub(crate) fn wrap(script: &str) -> String {
     )
 }
 
-/// The script's words, dequoted, read from the same comment-stripped code the
-/// classification and the gates read.
+/// True for a command [`wrap`] produced.
 ///
-/// `None` when the comment scan refuses, i.e. when the two shells disagree
-/// about where a comment starts. Callers that answer a security question about
-/// the script — "could a deny rule match anything in here" — must read these
-/// words rather than the raw text: an apostrophe in a comment opens the shared
-/// lexer's quote state and swallows everything after it into one argument.
-pub(crate) fn code_words(cmd: &str) -> Option<Vec<String>> {
-    Some(lexer::shell_split(&strip_comments(cmd)?))
+/// The wrap's promise is that its strongest outcome is `Ask`: the script
+/// travels unattested, and the verdict it was judged against was read as bash.
+/// Anything that may relax an ask — `hooks::decision::ApprovalOwner` — asks
+/// this first.
+pub(crate) fn is_wrapped(cmd: &str) -> bool {
+    cmd.starts_with("rtk run --shell fish -c '")
+}
+
+/// The script's words, dequoted and grouped by the command they belong to,
+/// read from the same comment-stripped code the classification and the gates
+/// read.
+///
+/// Callers that answer a security question about the script — "could a deny
+/// rule match anything in here" — must read these words rather than the raw
+/// text: an apostrophe in a comment opens the shared lexer's quote state and
+/// swallows everything after it into one argument.
+///
+/// Grouping matters as much as dequoting. `shell_split` alone merges a word
+/// with the operator glued to it, so `not git push; echo blocked` yields
+/// `push;` and a rule naming `git push` never matches. Splitting on command
+/// separators first makes a run of words a run of one command's argv.
+///
+/// `None` means *the words cannot be read*, which a security caller must treat
+/// as "assume the worst":
+/// - the comment scan refuses (the two shells disagree where a comment starts);
+/// - the code carries a `\r`, which bash keeps inside the word and fish does
+///   not, so `pwd\r` here is `pwd` there;
+/// - the code carries a backslash outside single quotes. Bash and fish resolve
+///   those differently in both directions — bash elides `\<newline>` to join
+///   words while this lexer keeps the newline, and fish expands `\x70` to `p`
+///   while bash leaves `x70` — so the word this reads is not the word fish
+///   runs. (`\\` and `\'`, the single-quote divergences, are refused outright
+///   by [`try_wrap`] before this is ever consulted.)
+/// - the code carries a character fish resolves at run time outside single
+///   quotes — `$`, `{`, `*`, `[` or `~`. `set -l r echo; $r DENIED` runs
+///   `echo DENIED` and `/bin/ec*o` runs `/bin/echo`; no reading of the text
+///   says so.
+pub(crate) fn code_word_runs(cmd: &str) -> Option<Vec<Vec<String>>> {
+    let code = strip_comments(cmd)?;
+    if code.contains('\r') || has_unreadable_word(&code) {
+        return None;
+    }
+    Some(
+        command_texts(&code)
+            .iter()
+            .map(|segment| {
+                // An empty argument (`echo '' DENIED`) is not a word any
+                // matcher can see: the permission gate's own normalization
+                // drops it, so the words either side are adjacent there and
+                // have to be adjacent here.
+                lexer::shell_split(segment)
+                    .into_iter()
+                    .filter(|word| !word.is_empty())
+                    .collect()
+            })
+            .collect(),
+    )
+}
+
+/// True for a character outside single quotes whose word this lexer reads
+/// differently from the way fish runs it.
+///
+/// Single-quoted text is literal in both shells once [`try_wrap`] has refused
+/// `\\` and `\'`. Everything else is fair game, double quotes included: both
+/// shells resolve escapes and expansions there and they do not resolve the
+/// same ones, so only `'…'` suppresses the refusal. The test is the character,
+/// not whether it would expand — `echo "{a}"` is literal in fish, but deciding
+/// that requires being fish.
+///
+/// - `\` — bash elides `\<newline>`, fish expands `\x70` to `p`;
+/// - `$` — an expansion, whose value is the command fish runs, not the text;
+/// - `{` — a brace list, which fish expands into several words;
+/// - `*` and `[` — globs, which fish resolves against the filesystem, so
+///   `/bin/ec*o` is `/bin/echo` by the time it runs;
+/// - `~` *at the start of a word* — home-directory expansion, likewise
+///   resolved before the command runs. Fish expands it nowhere else, so
+///   `git diff HEAD~3 HEAD` reads as itself.
+fn has_unreadable_word(code: &str) -> bool {
+    let mut quote: Option<char> = None;
+    let mut word_start = true;
+    for c in code.chars() {
+        match c {
+            '\'' | '"' if quote.is_none() => quote = Some(c),
+            _ if quote == Some(c) => quote = None,
+            '\\' | '$' | '{' | '*' | '[' if quote != Some('\'') => return true,
+            '~' if word_start && quote.is_none() => return true,
+            _ => {}
+        }
+        // Quoted text is one word however it is spaced, and an operator ends
+        // the word before it as surely as a space does.
+        word_start =
+            quote.is_none() && matches!(c, ' ' | '\t' | '\n' | ';' | '|' | '&' | '(' | ')');
+    }
+    false
+}
+
+/// The code split where a command ends, with redirects removed rather than
+/// truncated at.
+///
+/// `lexer::split_for_permissions` is the gate's own segmenter and cuts each
+/// segment at its first redirect, which is right for a gate reading the
+/// command *before* the redirect. It is wrong for reading argv: fish keeps
+/// `DENIED` in `echo A 2>&1 DENIED` as an argument of `echo`, so a segment
+/// ending at `2>&1` hides it. Here the redirect and its operand are dropped
+/// and the words either side belong to the same command, as the shell runs it.
+///
+/// Words glued together in the source stay glued (`'a'b` is one word); a
+/// dropped redirect always separates, since a redirect ends a word in both
+/// shells.
+fn command_texts(code: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut last_end: Option<usize> = None;
+
+    let tokens = lexer::tokenize_with_newlines(code);
+    let mut i = 0;
+    while let Some(token) = tokens.get(i) {
+        i += 1;
+        let end = token.offset + token.value.len();
+        match token.kind {
+            TokenKind::Operator | TokenKind::Pipe(_) => {
+                segments.push(std::mem::take(&mut current));
+                last_end = None;
+            }
+            TokenKind::Shellism if matches!(token.value.as_str(), "&" | "(" | ")") => {
+                segments.push(std::mem::take(&mut current));
+                last_end = None;
+            }
+            TokenKind::Redirect => {
+                i = skip_redirect_operand(&tokens, i, &token.value);
+                last_end = None;
+            }
+            _ => {
+                if !current.is_empty() && last_end != Some(token.offset) {
+                    current.push(' ');
+                }
+                current.push_str(&token.value);
+                last_end = Some(end);
+            }
+        }
+    }
+    segments.push(current);
+
+    segments.retain(|segment| !segment.trim().is_empty());
+    segments
+}
+
+/// Index of the first token after a redirect's operand.
+///
+/// An fd duplication carries its target inside the operator (`2>&1`), so what
+/// follows is an argument of the command, not a redirect target. Every other
+/// redirect takes the next word, glued (`2>/dev/null`) or spaced
+/// (`2> /dev/null`) — and only that word, since `> f arg` redirects to `f` and
+/// passes `arg` to the command.
+fn skip_redirect_operand(tokens: &[ParsedToken], mut i: usize, redirect: &str) -> usize {
+    if !lexer::redirect_takes_operand(redirect) {
+        return i;
+    }
+    let ends_operand = |part: &ParsedToken| {
+        matches!(
+            part.kind,
+            TokenKind::Operator | TokenKind::Pipe(_) | TokenKind::Shellism
+        )
+    };
+    let Some(first) = tokens.get(i).filter(|part| !ends_operand(part)) else {
+        return i;
+    };
+    // A word can be several tokens (`>$HOME/x`), which the lexer reports with
+    // no gap between them.
+    let mut operand_end = first.offset + first.value.len();
+    i += 1;
+    while let Some(part) = tokens.get(i) {
+        if part.offset != operand_end || ends_operand(part) {
+            break;
+        }
+        operand_end = part.offset + part.value.len();
+        i += 1;
+    }
+    i
 }
 
 /// True for fish's `(cmd)` command substitution, which the shared lexer reads
@@ -581,6 +762,94 @@ mod tests {
         );
     }
 
+    /// The words a security caller reads are one command's argv, with the
+    /// redirect removed rather than truncated at — fish keeps `DENIED` as an
+    /// argument of `echo`, and a reader that stops at `2>&1` never sees it.
+    #[test]
+    fn test_code_word_runs_keeps_argv_across_a_redirect() {
+        let argv = |words: &[&str]| {
+            Some(vec![
+                words
+                    .iter()
+                    .map(|word| word.to_string())
+                    .collect::<Vec<_>>(),
+            ])
+        };
+        // An fd duplication carries its target; a redirect's own operand goes,
+        // glued or spaced, and the words either side stay with the command.
+        assert_eq!(
+            code_word_runs("not echo A 2>&1 DENIED"),
+            argv(&["not", "echo", "A", "DENIED"])
+        );
+        assert_eq!(
+            code_word_runs("not echo 2>/dev/null DENIED"),
+            argv(&["not", "echo", "DENIED"])
+        );
+        assert_eq!(
+            code_word_runs("not echo 2> /dev/null DENIED"),
+            argv(&["not", "echo", "DENIED"])
+        );
+    }
+
+    /// An empty argument is a word to the lexer and nothing at all to the
+    /// matcher, which normalizes it away — so the words either side have to be
+    /// adjacent here too, or a rule naming them both misses.
+    #[test]
+    fn test_code_word_runs_drops_empty_arguments() {
+        assert_eq!(
+            code_word_runs("not echo '' A DENIED"),
+            Some(vec![vec![
+                "not".to_string(),
+                "echo".to_string(),
+                "A".to_string(),
+                "DENIED".to_string()
+            ]])
+        );
+    }
+
+    /// One list per command, so a run of words is an argv a shell assembles:
+    /// `push;` is not a word, and `echo` belongs to the next command.
+    #[test]
+    fn test_code_word_runs_groups_by_command() {
+        assert_eq!(
+            code_word_runs("not git push; echo blocked"),
+            Some(vec![
+                vec!["not".to_string(), "git".to_string(), "push".to_string()],
+                vec!["echo".to_string(), "blocked".to_string()]
+            ])
+        );
+    }
+
+    /// `None` is "these words cannot be read", the answer a security caller
+    /// has to treat as the worst case: an escape the two shells resolve
+    /// differently, a `\r`, or anything fish resolves at run time — a
+    /// variable, a brace list, a glob, a `~`.
+    #[test]
+    fn test_code_word_runs_refuses_what_it_cannot_read() {
+        for cmd in [
+            "if not pwd\r\n  echo BODY\r\nend",
+            "if not \\x70wd\n  echo BODY\nend",
+            "if not p\\\nwd\n  echo BODY\nend",
+            "set -l runner echo; $runner DENIED; and true",
+            "set -l a p; set -l b wd; $a$b; and true",
+            "{echo,ls} DENIED; and true",
+            "echo \"it's $HOME\"; and true",
+            "not /bin/ec*o DENIED",
+            "not /bin/ec[h]o DENIED",
+            "not echo ~root",
+        ] {
+            assert_eq!(code_word_runs(cmd), None, "{cmd:?}");
+        }
+        // Single-quoted text is literal in both shells, so it reads fine.
+        assert_eq!(
+            code_word_runs("echo '$HOME {a,b}'; and true"),
+            Some(vec![
+                vec!["echo".to_string(), "$HOME {a,b}".to_string()],
+                vec!["and".to_string(), "true".to_string()]
+            ])
+        );
+    }
+
     #[cfg(not(windows))]
     #[test]
     fn test_double_backslash_script_is_not_wrapped() {
@@ -595,6 +864,25 @@ mod tests {
     fn test_backslash_quote_script_is_not_wrapped() {
         // Contains `\'`, which fish single-quotes turn into a literal quote.
         assert!(try_wrap_gated("echo \\'; and echo ok", true).is_none());
+    }
+
+    /// `&|` is fish's stdout-and-stderr pipe. The shared lexer reads it as a
+    /// background `&` plus a pipe and the rewrite re-emits the two spaced,
+    /// which fish rejects — so a wrap would hand back a script fish cannot
+    /// parse. The `fish -c` wrapper path refuses the same shape.
+    #[cfg(not(windows))]
+    #[test]
+    fn test_fish_stderr_pipe_is_not_wrapped() {
+        for cmd in [
+            "git status &| cat; and true",
+            "git log -5 &| head -3; and true",
+            "begin\n  git status &| cat\nend",
+        ] {
+            assert!(try_wrap_gated(cmd, true).is_none(), "{cmd:?}");
+        }
+        // A background `&` followed by a *separate* pipeline still wraps: the
+        // two are only the fish pipe when they are adjacent.
+        assert!(try_wrap_gated("sleep 1 & git status | cat; and true", true).is_some());
     }
 
     #[test]

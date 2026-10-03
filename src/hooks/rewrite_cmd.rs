@@ -83,7 +83,9 @@ pub(crate) fn track_tee_read(cmd: &str) {
 /// *default* ask (no rule matched) as exit 0 for it and nothing else — see
 /// [`decision::ApprovalOwner`]. An explicit `ask` rule the user wrote still
 /// renders as exit 3, so the host can keep prompting for the command the user
-/// asked about, and [`decision::ApprovalOwner::apply`] cannot transform a
+/// asked about, and so does a fish wrap, whose verdict was read as bash and so
+/// says nothing about the script's own commands.
+/// [`decision::ApprovalOwner::apply`] cannot transform a
 /// [`HookDecision::Deny`]: an explicit deny still reaches this function as
 /// `Deny` and still renders as exit 2, for every delegate, named or not.
 pub fn run(cmd: &str) -> anyhow::Result<()> {

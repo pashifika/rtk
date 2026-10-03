@@ -426,23 +426,39 @@ fish execution:
 if test -d src
   git status
 end
-# → rtk run --shell fish -c 'if test -d src\n  rtk git status\nend'
+# → rtk run --shell fish -c 'if test -d src\n  git status\nend'
+
+git diff HEAD~3 HEAD; and true
+# → rtk run --shell fish -c 'rtk git diff HEAD~3 HEAD; and true'
 ```
 
 The script travels inside one quoted argument, so both POSIX and fish host
 layers parse the wrapped command; its own commands go through the ordinary
-rewrite rules first, so wrapping costs no savings. The wrap always surfaces as
-an "ask" rewrite — never auto-allowed — because the script's content cannot be
-attested. It requires a resolvable `fish` binary, is disabled on Windows, and
-can be turned off with `wrap_fish_scripts = false` under `[hooks]` in the RTK
-config.
+rewrite rules first, so wrapping costs no savings (a *multi-line* block opened
+by `if`/`for`/`while`/`switch` is carried through unrewritten, as the rewrite
+rules leave such blocks alone; a single-line `if …; …; end` is rewritten like
+any other chain). The wrap always surfaces as an "ask" rewrite — never
+auto-allowed by RTK, for any host, including the delegates that own their own
+approval — because the script's content cannot be attested. A deny rule keeps
+it off entirely: every word of the script is checked against your deny rules,
+so a denied command reaches none of the places fish starts one. Where the
+words cannot be read as fish would read them — a word carrying `$`, `{`, `*`,
+`[`, `~`, a backslash escape or a carriage return outside single quotes, all
+of which fish resolves at run time — the wrap is withheld rather than cleared,
+so with deny rules configured such a script keeps the behaviour it had before
+this feature. It requires a resolvable
+`fish` binary, is disabled on Windows, and can be turned off with
+`wrap_fish_scripts = false` under `[hooks]` in the RTK config.
 
-Untouched: ambiguous scripts (shared `if`/`for` keywords without a fish-only
-marker, POSIX `then`/`do`/`fi` forms, heredocs, backticks), and any script RTK
-could not decompose for the permission gate — command or process substitution,
-including fish's own `(cmd)`, and a redirect to a file. `for f in (ls) … end`
-falls in that last group. Keep writing intentionally shell-specific scripts as
-`rtk run --shell <shell> -c '<script>'`.
+Not wrapped — these take the decision path they always did, ordinary rewrite
+rules included: ambiguous scripts (shared `if`/`for` keywords without a
+fish-only marker, POSIX `then`/`do`/`fi` forms, heredocs, backticks), any
+script RTK could not decompose for the permission gate (command or process
+substitution, including fish's own `(cmd)`, and a redirect to a file — so
+`for f in (ls) … end` is left to the host), a script containing `\\` or `\'`
+(fish and POSIX single quotes disagree about both), and fish's `&|` pipe,
+which the rewrite cannot re-emit in a form fish accepts. Keep writing
+intentionally shell-specific scripts as `rtk run --shell <shell> -c '<script>'`.
 
 ### Setup
 

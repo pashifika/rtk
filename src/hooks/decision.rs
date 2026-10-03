@@ -3,11 +3,16 @@
 //! Three entry points ask the same question — may this command be rewritten,
 //! and may the rewrite be auto-allowed?
 //!
-//! | Entry point | Verdict source | Identity rewrite |
+//! | Entry point | Rule source (deny/ask/allow, read once per call) | Identity rewrite |
 //! |---|---|---|
-//! | `rtk hook <agent>` (`hook_cmd`) | `check_command_for(cmd, host)` | suppressed |
-//! | `rtk rewrite` (`rewrite_cmd`, run as a subprocess by the shell/TS/Python delegates) | `check_command` (always `Host::Claude`) | reported |
+//! | `rtk hook <agent>` (`hook_cmd`) | `load_rules_for(host)` | suppressed |
+//! | `rtk rewrite` (`rewrite_cmd`, run as a subprocess by the shell/TS/Python delegates) | `load_rules_for(Host::Claude)` | reported |
 //! | `rtk hook check` (`main.rs`) | whatever the named `--agent` consults, via [`AgentPath`] | suppressed |
+//!
+//! Each reads its rules once and uses them twice: `check_command_with_rules`
+//! judges the command, and the deny side is handed to [`decide`] as well,
+//! because the fish wrap has to clear the rules the verdict was judged against
+//! (see [`deny_rule_could_match`]).
 //!
 //! [`decide`] is the shared answer. What legitimately differs between callers
 //! stays outside it: the verdict is passed in rather than looked up, so each
@@ -15,9 +20,10 @@
 //! machine's settings (#3146); the no-op-rewrite policy lives in
 //! [`decide_for_agent`], which every hook shares and the CLI does not; and
 //! whether the caller runs its own approval gate on the result lives in
-//! [`ApprovalOwner`], which only ever relaxes the *default* ask.
+//! [`ApprovalOwner`], which only ever relaxes the *default* ask, and never on
+//! a fish wrap.
 
-use super::permissions::{Host, PermissionVerdict, check_command_for};
+use super::permissions::{Host, PermissionVerdict};
 use crate::core::user_env;
 use crate::discover::registry::rewrite_command;
 
@@ -107,9 +113,18 @@ impl ApprovalOwner {
     /// never opted into them (#3908). An explicit [`PermissionVerdict::Ask`] is
     /// the user's own instruction and is left for the host to honour; every
     /// other decision passes through by construction.
+    ///
+    /// A fish wrap never relaxes, whatever the verdict says. The verdict was
+    /// judged by segmenters that read the script as bash, and bash does not
+    /// even start a command where fish does — so `Default` there means "no
+    /// rule was *read*", not "no rule matched". The wrap's own promise is that
+    /// its strongest outcome is `Ask`, and that has to hold for the delegate
+    /// path too.
     pub(crate) fn apply(self, decision: HookDecision, verdict: PermissionVerdict) -> HookDecision {
         match (self, verdict, decision) {
-            (Self::Delegate, PermissionVerdict::Default, HookDecision::AskRewrite(rewritten)) => {
+            (Self::Delegate, PermissionVerdict::Default, HookDecision::AskRewrite(rewritten))
+                if !crate::discover::fish_script::is_wrapped(&rewritten) =>
+            {
                 HookDecision::AllowRewrite(rewritten)
             }
             (_, _, other) => other,
@@ -200,11 +215,17 @@ pub(crate) fn decide_with_wrap(
     // can parse. Its own commands are rewritten first — the wrap would
     // otherwise cost every saving the rewrite rules deliver for the script's
     // leading command. Never auto-allowed: the script's content is not
-    // attested, so its strongest verdict is `Ask` even under an allow rule.
-    if wrap_fish(cmd).is_some() && !deny_rule_could_match(cmd, deny_rules) {
+    // attested, so its strongest verdict is `Ask` even under an allow rule
+    // (`ApprovalOwner::apply` leaves a wrap alone for the same reason).
+    if wrap_fish(cmd).is_some() {
         let rewritten = rewrite_command(cmd, excluded, transparent_prefixes);
         let script = rewritten.as_deref().unwrap_or(cmd);
-        return HookDecision::AskRewrite(crate::discover::fish_script::wrap(script));
+        // Both texts are asked about: the one the host submitted, and the one
+        // RTK would hand to the fish. The rewrite inserts commands of its own
+        // (`ls` becomes `rtk ls`), and a rule may name those.
+        if !deny_rule_could_match(cmd, deny_rules) && !deny_rule_could_match(script, deny_rules) {
+            return HookDecision::AskRewrite(crate::discover::fish_script::wrap(script));
+        }
     }
 
     if crate::discover::lexer::contains_unattestable_construct(cmd) {
@@ -231,18 +252,20 @@ pub(crate) fn decide_with_wrap(
 /// and dequoted words the classification reads, and the gate's own matcher
 /// answers for each run.
 ///
-/// Conservative by construction: a denied program named as a plain argument
-/// keeps the wrap off too. That costs a rewrite, never a guarantee.
+/// Conservative by construction, twice over: a denied program named as a plain
+/// argument keeps the wrap off, and so does a script whose words cannot be
+/// read the way fish would read them. Both cost a rewrite, never a guarantee.
 fn deny_rule_could_match(cmd: &str, deny_rules: &[String]) -> bool {
     if deny_rules.is_empty() {
         return false;
     }
-    let Some(words) = crate::discover::fish_script::code_words(cmd) else {
-        // The comment scan refused, so the words are not known — and a wrap
-        // cannot be cleared on words nobody could read.
+    let Some(segments) = crate::discover::fish_script::code_word_runs(cmd) else {
+        // The words are not known — a comment the two shells read differently,
+        // or an escape whose resolution differs between this lexer and fish —
+        // and a wrap cannot be cleared on words nobody could read.
         return true;
     };
-    super::permissions::deny_matches_any_word_run(&words, deny_rules)
+    super::permissions::deny_matches_any_word_run(&segments, deny_rules)
 }
 
 /// [`decide`], plus the no-op suppression every agent applies.
@@ -393,26 +416,17 @@ impl AgentPath {
         "windsurf",
     ];
 
-    /// The verdict this agent's hook would judge `cmd` against.
-    fn verdict(&self, cmd: &str) -> PermissionVerdict {
+    /// The rules this agent's hook judges `cmd` against — read once, because
+    /// the verdict and the fish wrap both need them.
+    fn rules(&self) -> (Vec<String>, Vec<String>, Vec<String>) {
         match self {
-            Self::InProcess(host) => check_command_for(cmd, *host),
+            Self::InProcess(host) => super::permissions::load_rules_for(*host),
             // `rtk rewrite` always reads Claude Code's rules, for every
             // delegate. Naming a host changes what is done with the verdict,
             // never where the verdict comes from.
-            Self::ViaRewrite(_) => check_command_for(cmd, Host::Claude),
+            Self::ViaRewrite(_) => super::permissions::load_rules_for(Host::Claude),
             // No hook, so no rules to consult.
-            Self::RulesOnly => PermissionVerdict::Default,
-        }
-    }
-
-    /// The deny rules this agent's hook judges `cmd` against — the same ones
-    /// [`AgentPath::verdict`] reads, which the fish wrap must also clear.
-    fn deny_rules(&self) -> Vec<String> {
-        match self {
-            Self::InProcess(host) => super::permissions::load_rules_for(*host).0,
-            Self::ViaRewrite(_) => super::permissions::load_rules_for(Host::Claude).0,
-            Self::RulesOnly => Vec::new(),
+            Self::RulesOnly => (Vec::new(), Vec::new(), Vec::new()),
         }
     }
 
@@ -429,9 +443,10 @@ impl AgentPath {
     /// runtime, including discarding a rewrite that changed nothing and
     /// relaxing the default ask the agent would only ask about twice.
     pub(crate) fn decide(&self, cmd: &str) -> HookDecision {
-        let verdict = self.verdict(cmd);
+        let (deny, ask, allow) = self.rules();
+        let verdict = super::permissions::check_command_with_rules(cmd, &deny, &ask, &allow);
         self.approval_owner()
-            .apply(decide_for_agent(cmd, verdict, &self.deny_rules()), verdict)
+            .apply(decide_for_agent(cmd, verdict, &deny), verdict)
     }
 }
 
@@ -584,20 +599,80 @@ mod tests {
         /// condition of an `if`/`while`, the right side of `and`/`or`/`not`.
         /// So a deny rule that matches a run of words anywhere keeps the wrap
         /// off rather than being read through one segmentation.
+        ///
+        /// Each row is a rule and a script the rule has to reach; the property
+        /// is *never wrapped*, whatever the decision turns out to be.
         #[cfg(not(windows))]
         #[test]
         fn a_deny_rule_keeps_the_wrap_off_wherever_it_matches() {
-            let deny = vec!["rm:*".to_string()];
-            for cmd in [
-                "test -d src; and rm -rf victim",
-                "not rm -rf victim",
-                "if not rm -rf victim\n  echo x\nend",
-                "while rm -rf victim\n  break\nend",
-                "if test -d src\n  true; and rm -rf victim\nend",
+            for (rule, cmd) in [
+                ("rm:*", "test -d src; and rm -rf victim"),
+                ("rm:*", "not rm -rf victim"),
+                ("rm:*", "if not rm -rf victim\n  echo x\nend"),
+                ("rm:*", "while rm -rf victim\n  break\nend"),
+                ("rm:*", "if test -d src\n  true; and rm -rf victim\nend"),
                 // The words are compared dequoted, as the shell reads them.
-                "if not 'rm' -rf victim\n  echo x\nend",
-                "if not r'm' -rf victim\n  echo x\nend",
+                ("rm:*", "if not 'rm' -rf victim\n  echo x\nend"),
+                ("rm:*", "if not r'm' -rf victim\n  echo x\nend"),
+                // A word carries the operator glued to it (`push;`), so runs
+                // are read per segment rather than across the whole script.
+                ("git push:*", "not git push; echo blocked"),
+                ("git push:*", "not git push|cat"),
+                // A rule may anchor its tail, so a run has to be able to end
+                // before the segment does — `echo ARG DENIED` is a command
+                // here, with `extra` an argument of the same one.
+                ("echo * DENIED", "if not echo ARG DENIED\n  echo BODY\nend"),
+                ("echo * DENIED", "not echo ARG DENIED extra; and true"),
+                ("rm * victim", "if not rm -rf victim\n  echo x\nend"),
+                // A `\r` splits words in fish and stays inside one here, so
+                // `git\rpush` runs `git push` and reads as a single word.
+                ("git push:*", "not git\rpush; and true"),
+                // The rewrite inserts commands of its own, and a rule may name
+                // those: the emitted script is asked about as well as the
+                // submitted one.
+                ("rtk ls:*", "ls; and true"),
+                ("rtk git:*", "git diff HEAD~3 HEAD; and true"),
+                // Escapes this lexer and fish resolve differently: a `\r` bash
+                // keeps inside the word, a line continuation fish elides, and
+                // `\x70`, which is `p` to fish and `x70` here. The words cannot
+                // be read, so the wrap is refused rather than cleared.
+                ("pwd:*", "if not pwd\r\n  echo BODY\r\nend"),
+                ("pwd:*", "if not p\\\nwd\n  echo BODY\nend"),
+                ("pwd:*", "if not \\x70wd\n  echo BODY\nend"),
+                // A redirect ends the word, not the command: fish still passes
+                // what follows it to the same program.
+                ("echo * DENIED", "not echo A 2>&1 DENIED"),
+                ("git push:*", "not git 2>&1 push"),
+                // The words arrive dequoted, so a rule the user wrote quoted —
+                // the spelling the unwrapped gate matches raw — is tried
+                // dequoted too.
+                (
+                    "echo \"DENIED\"",
+                    "if not echo \"DENIED\"\n  echo BODY\nend",
+                ),
+                ("echo 'DENIED'", "if not echo DENIED\n  echo BODY\nend"),
+                // An expansion's value is the command fish runs, and no reading
+                // of `$runner` says which.
+                (
+                    "echo DENIED",
+                    "set -l runner echo; $runner DENIED; and true",
+                ),
+                ("pwd:*", "set -l a p; set -l b wd; $a$b; and true"),
+                ("echo:*", "{echo,ls} DENIED; and true"),
+                // An empty argument is a word to the lexer and nothing at all
+                // to the matcher, so the words either side are adjacent there.
+                ("echo * DENIED", "not echo '' A DENIED"),
+                // A redirect's operand may be spaced off the operator; what
+                // comes after the operand is the command's own argument.
+                ("echo DENIED", "not echo 2> /dev/null DENIED"),
+                ("echo A DENIED", "not echo A 2> /dev/null DENIED"),
+                // A glob, a bracket and a `~` resolve before the command runs,
+                // so the word in the text is not the word fish executes.
+                ("/bin/echo DENIED", "not /bin/ec*o DENIED"),
+                ("/bin/echo DENIED", "not /bin/ec[h]o DENIED"),
+                ("echo /var/root", "not echo ~root"),
             ] {
+                let deny = vec![rule.to_string()];
                 let decided =
                     decide_with_wrap(cmd, PermissionVerdict::Default, &[], &[], &deny, wrap_stub);
                 assert!(
@@ -606,30 +681,38 @@ mod tests {
                         HookDecision::AskRewrite(rewritten)
                             if rewritten.starts_with("rtk run --shell fish")
                     ),
-                    "a denied command must never be wrapped: {cmd:?} -> {decided:?}"
+                    "a denied command must never be wrapped: {rule:?} {cmd:?} -> {decided:?}"
                 );
             }
         }
 
-        /// Only what the rules name: an unrelated rule costs nothing, and with
-        /// no rules at all the gate is not consulted.
+        /// Only what the rules name: an unrelated rule costs nothing, with no
+        /// rules at all the gate is not consulted, and a rule naming nothing —
+        /// an empty string — does not match the empty argument in `printf %s ''`.
         #[cfg(not(windows))]
         #[test]
         fn an_unrelated_deny_rule_leaves_the_wrap_alone() {
-            for deny in [vec![], vec!["git push:*".to_string()]] {
+            for (deny, cmd, wrapped) in [
+                (
+                    vec![],
+                    "test -d src; and git status",
+                    "rtk run --shell fish -c 'test -d src; and git status'",
+                ),
+                (
+                    vec!["git push:*".to_string()],
+                    "test -d src; and git status",
+                    "rtk run --shell fish -c 'test -d src; and git status'",
+                ),
+                (
+                    vec![String::new()],
+                    "not printf %s ''",
+                    "rtk run --shell fish -c 'not printf %s '\\'''\\'''",
+                ),
+            ] {
                 assert_eq!(
-                    decide_with_wrap(
-                        "test -d src; and git status",
-                        PermissionVerdict::Default,
-                        &[],
-                        &[],
-                        &deny,
-                        wrap_stub
-                    ),
-                    HookDecision::AskRewrite(
-                        "rtk run --shell fish -c 'test -d src; and git status'".to_string()
-                    ),
-                    "{deny:?}"
+                    decide_with_wrap(cmd, PermissionVerdict::Default, &[], &[], &deny, wrap_stub),
+                    HookDecision::AskRewrite(wrapped.to_string()),
+                    "{deny:?} {cmd:?}"
                 );
             }
         }
@@ -670,6 +753,43 @@ mod tests {
                 ),
                 HookDecision::AskRewrite(_)
             ));
+        }
+
+        /// The delegate relaxation cannot reach the wrap either. A `Default`
+        /// verdict on a fish script means the segmenters found no rule to read,
+        /// not that the user wrote none — `and cargo test` is a command called
+        /// `and` to them, so an explicit `ask` on `cargo test` never matched.
+        #[cfg(not(windows))]
+        #[test]
+        fn the_delegate_relaxation_cannot_auto_allow_a_wrap() {
+            let wrapped = decide_with_wrap(
+                "test -d src; and cargo test",
+                PermissionVerdict::Default,
+                &[],
+                &[],
+                &[],
+                wrap_stub,
+            );
+            assert_eq!(
+                super::super::ApprovalOwner::Delegate.apply(wrapped, PermissionVerdict::Default),
+                HookDecision::AskRewrite(
+                    "rtk run --shell fish -c 'test -d src; and cargo test'".to_string()
+                )
+            );
+
+            // The relaxation itself is intact for an ordinary rewrite.
+            let plain = decide_with_wrap(
+                "git status",
+                PermissionVerdict::Default,
+                &[],
+                &[],
+                &[],
+                wrap_none,
+            );
+            assert_eq!(
+                super::super::ApprovalOwner::Delegate.apply(plain, PermissionVerdict::Default),
+                HookDecision::AllowRewrite("rtk git status".to_string())
+            );
         }
 
         /// A deny rule still wins: the wrap is never consulted.
@@ -787,6 +907,13 @@ mod tests {
         }
     }
 
+    /// The verdict an agent's path judges `cmd` against, read through the one
+    /// rule load [`AgentPath::decide`] performs.
+    fn verdict_for(path: &AgentPath, cmd: &str) -> PermissionVerdict {
+        let (deny, ask, allow) = path.rules();
+        super::super::permissions::check_command_with_rules(cmd, &deny, &ask, &allow)
+    }
+
     #[test]
     fn agent_path_rejects_the_unknown() {
         assert!(AgentPath::lookup("nope").is_none());
@@ -801,7 +928,7 @@ mod tests {
             Some(AgentPath::InProcess(Host::Codex))
         ));
         assert_eq!(
-            check_command_for("git status", Host::Codex),
+            verdict_for(&AgentPath::InProcess(Host::Codex), "git status"),
             PermissionVerdict::Default
         );
         let (deny, ask, allow) = super::super::permissions::load_rules_for(Host::Codex);
@@ -815,7 +942,7 @@ mod tests {
             Some(AgentPath::InProcess(Host::Antigravity))
         ));
         assert_eq!(
-            check_command_for("git status", Host::Antigravity),
+            verdict_for(&AgentPath::InProcess(Host::Antigravity), "git status"),
             PermissionVerdict::Default
         );
         let (deny, ask, allow) = super::super::permissions::load_rules_for(Host::Antigravity);
@@ -827,7 +954,7 @@ mod tests {
     #[test]
     fn rules_only_agent_uses_the_default_verdict() {
         assert_eq!(
-            AgentPath::RulesOnly.verdict("git status"),
+            verdict_for(&AgentPath::RulesOnly, "git status"),
             PermissionVerdict::Default
         );
     }
@@ -921,8 +1048,8 @@ mod tests {
         assert_eq!(
             AgentPath::lookup("openclaw")
                 .expect("openclaw resolves")
-                .verdict("git status"),
-            check_command_for("git status", Host::Claude),
+                .rules(),
+            super::super::permissions::load_rules_for(Host::Claude),
             "naming a host must not change whose rules are read"
         );
     }

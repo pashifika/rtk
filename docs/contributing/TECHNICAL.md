@@ -116,17 +116,22 @@ LLM Agent: "cargo fmt --all && cargo test 2>&1 | tail -20"
   v
 rewrite_cmd::run(cmd)                              [src/hooks/rewrite_cmd.rs]
   |  1. Load config → hooks.exclude_commands
-  |  2. check_command(cmd) → Deny → exit(2)
-  |  3. registry::rewrite_command(cmd, excluded)
+  |  2. permissions::load_rules_for(Host::Claude) → deny/ask/allow, read once
+  |     check_command_with_rules(cmd, …) → Deny → exit(2)
+  |  3. decision::decide — a provably-fish script is wrapped as
+  |     `rtk run --shell fish -c '<script>'`, unless a deny rule matches a
+  |     run of words anywhere in it; otherwise
+  |     registry::rewrite_command(cmd, excluded)
   |     → None → exit(1)          (no RTK equivalent, passthrough)
   |     → Some + Allow → print, exit(0)
   |     → Some + Ask   → print, exit(3)
   |  4. ApprovalOwner::from_env() — RTK_REWRITE_HOST names the calling
   |     delegate. For one that gates the rewritten command itself
   |     (OpenClaw), a Default ask renders as exit(0) instead of exit(3); an
-  |     explicit Ask rule still exits 3 so the host can prompt. Deny and
-  |     passthrough are untouched, so this never relaxes a deny or drops an
-  |     explicit ask.
+  |     explicit Ask rule still exits 3 so the host can prompt, and a fish
+  |     wrap always exits 3, since the verdict behind it was read as bash.
+  |     Deny and passthrough are untouched, so this never relaxes a deny or
+  |     drops an explicit ask.
   |
   v
 rewrite_command(cmd, excluded)                     [src/discover/registry.rs]
